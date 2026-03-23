@@ -43,6 +43,7 @@ class BlenderMCPServer:
         self.running = False
         self.socket = None
         self.server_thread = None
+        self._last_snapshot = None
 
     def start(self):
         if self.running:
@@ -206,6 +207,8 @@ class BlenderMCPServer:
         handlers = {
             "get_scene_info": self.get_scene_info,
             "get_object_info": self.get_object_info,
+            "snapshot_scene": self.snapshot_scene,
+            "diff_scene": self.diff_scene,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
             "get_telemetry_consent": self.get_telemetry_consent,
@@ -360,6 +363,235 @@ class BlenderMCPServer:
             }
 
         return obj_info
+
+    def _round_vec(self, vec, decimals=4):
+        return [round(float(v), decimals) for v in vec]
+
+    def _get_fcurves(self, action):
+        """Get fcurves from an action, handling both layered (Blender 4.x) and legacy actions."""
+        if hasattr(action, 'is_action_layered') and action.is_action_layered:
+            try:
+                return action.layers[0].strips[0].channelbags[0].fcurves
+            except (IndexError, AttributeError):
+                return []
+        if hasattr(action, 'fcurves'):
+            return action.fcurves
+        return []
+
+    def _get_keyframes(self, obj):
+        """Extract keyframe data for an object, grouped by data_path."""
+        keyframes = {}
+        if not obj.animation_data or not obj.animation_data.action:
+            return keyframes
+        fcurves = self._get_fcurves(obj.animation_data.action)
+        for fc in fcurves:
+            path = fc.data_path
+            frames = sorted(set(round(kf.co[0]) for kf in fc.keyframe_points))
+            if path in keyframes:
+                keyframes[path] = sorted(set(keyframes[path] + frames))
+            else:
+                keyframes[path] = frames
+        return keyframes
+
+    def _get_material_props(self, mat):
+        """Extract Principled BSDF properties from a material."""
+        props = {"base_color": None, "roughness": None, "metallic": None, "transmission": None}
+        if not mat.use_nodes or not mat.node_tree:
+            return props
+        for node in mat.node_tree.nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                props["base_color"] = self._round_vec(node.inputs["Base Color"].default_value)
+                props["roughness"] = round(float(node.inputs["Roughness"].default_value), 4)
+                props["metallic"] = round(float(node.inputs["Metallic"].default_value), 4)
+                transmission_input = node.inputs.get("Transmission Weight") or node.inputs.get("Transmission")
+                if transmission_input:
+                    props["transmission"] = round(float(transmission_input.default_value), 4)
+                break
+        return props
+
+    def _build_snapshot(self):
+        """Build a complete snapshot of the current scene state."""
+        from datetime import datetime
+        scene = bpy.context.scene
+
+        snapshot = {
+            "timestamp": datetime.now().isoformat(timespec='seconds'),
+            "scene_name": scene.name,
+            "timeline": {
+                "frame_start": scene.frame_start,
+                "frame_end": scene.frame_end,
+                "fps": scene.render.fps,
+                "current_frame": scene.frame_current,
+            },
+            "objects": {},
+            "materials": {},
+            "cameras": {},
+            "lights": {},
+        }
+
+        for obj in scene.objects:
+            obj_data = {
+                "type": obj.type,
+                "location": self._round_vec(obj.location),
+                "rotation": self._round_vec(obj.rotation_euler),
+                "scale": self._round_vec(obj.scale),
+                "visible": obj.visible_get(),
+                "parent": obj.parent.name if obj.parent else None,
+                "children": [c.name for c in obj.children],
+                "materials": [slot.material.name for slot in obj.material_slots if slot.material],
+                "keyframes": self._get_keyframes(obj),
+            }
+            snapshot["objects"][obj.name] = obj_data
+
+            if obj.type == 'CAMERA' and obj.data:
+                snapshot["cameras"][obj.name] = {
+                    "location": self._round_vec(obj.location),
+                    "rotation": self._round_vec(obj.rotation_euler),
+                    "focal_length": round(float(obj.data.lens), 4),
+                    "sensor_width": round(float(obj.data.sensor_width), 4),
+                    "sensor_height": round(float(obj.data.sensor_height), 4),
+                }
+
+            if obj.type == 'LIGHT' and obj.data:
+                snapshot["lights"][obj.name] = {
+                    "location": self._round_vec(obj.location),
+                    "rotation": self._round_vec(obj.rotation_euler),
+                    "light_type": obj.data.type,
+                    "color": self._round_vec(obj.data.color),
+                    "energy": round(float(obj.data.energy), 4),
+                }
+
+        for mat in bpy.data.materials:
+            snapshot["materials"][mat.name] = self._get_material_props(mat)
+
+        return snapshot
+
+    def snapshot_scene(self):
+        """Take a snapshot of the current scene and store it as baseline."""
+        try:
+            self._last_snapshot = self._build_snapshot()
+            return self._last_snapshot
+        except Exception as e:
+            print(f"Error in snapshot_scene: {str(e)}")
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def _diff_dicts(self, old, new, keys):
+        """Compare specific keys between two dicts, return changed keys."""
+        changes = {}
+        for k in keys:
+            old_val = old.get(k)
+            new_val = new.get(k)
+            if old_val != new_val:
+                changes[k] = {"old": old_val, "new": new_val}
+        return changes
+
+    def diff_scene(self):
+        """Compare current scene state against the last snapshot."""
+        if self._last_snapshot is None:
+            return {"error": "No snapshot taken yet. Call snapshot_scene first."}
+
+        try:
+            current = self._build_snapshot()
+            old = self._last_snapshot
+            diff = {
+                "has_changes": False,
+                "summary": "",
+                "added_objects": [],
+                "removed_objects": [],
+                "modified_objects": {},
+                "added_materials": [],
+                "removed_materials": [],
+                "modified_materials": {},
+                "camera_changes": {},
+                "light_changes": {},
+                "timeline_changes": {},
+                "keyframe_changes": {},
+            }
+
+            # Objects
+            old_objs = set(old["objects"].keys())
+            new_objs = set(current["objects"].keys())
+            diff["added_objects"] = sorted(new_objs - old_objs)
+            diff["removed_objects"] = sorted(old_objs - new_objs)
+
+            obj_props = ["location", "rotation", "scale", "visible", "parent", "materials"]
+            for name in old_objs & new_objs:
+                changes = self._diff_dicts(old["objects"][name], current["objects"][name], obj_props)
+                if changes:
+                    diff["modified_objects"][name] = changes
+
+            # Materials
+            old_mats = set(old["materials"].keys())
+            new_mats = set(current["materials"].keys())
+            diff["added_materials"] = sorted(new_mats - old_mats)
+            diff["removed_materials"] = sorted(old_mats - new_mats)
+
+            mat_props = ["base_color", "roughness", "metallic", "transmission"]
+            for name in old_mats & new_mats:
+                changes = self._diff_dicts(old["materials"][name], current["materials"][name], mat_props)
+                if changes:
+                    diff["modified_materials"][name] = changes
+
+            # Cameras
+            cam_props = ["location", "rotation", "focal_length", "sensor_width", "sensor_height"]
+            for name in set(old["cameras"].keys()) & set(current["cameras"].keys()):
+                changes = self._diff_dicts(old["cameras"][name], current["cameras"][name], cam_props)
+                if changes:
+                    diff["camera_changes"][name] = changes
+
+            # Lights
+            light_props = ["location", "rotation", "light_type", "color", "energy"]
+            for name in set(old["lights"].keys()) & set(current["lights"].keys()):
+                changes = self._diff_dicts(old["lights"][name], current["lights"][name], light_props)
+                if changes:
+                    diff["light_changes"][name] = changes
+
+            # Timeline
+            timeline_props = ["frame_start", "frame_end", "fps"]
+            diff["timeline_changes"] = self._diff_dicts(old["timeline"], current["timeline"], timeline_props)
+
+            # Keyframes
+            for name in old_objs & new_objs:
+                old_kf = old["objects"][name].get("keyframes", {})
+                new_kf = current["objects"][name].get("keyframes", {})
+                if old_kf != new_kf:
+                    kf_changes = {}
+                    all_paths = set(old_kf.keys()) | set(new_kf.keys())
+                    for path in all_paths:
+                        if old_kf.get(path) != new_kf.get(path):
+                            kf_changes[path] = {"old": old_kf.get(path, []), "new": new_kf.get(path, [])}
+                    if kf_changes:
+                        diff["keyframe_changes"][name] = kf_changes
+
+            # Summary
+            parts = []
+            if diff["added_objects"]:
+                parts.append(f"{len(diff['added_objects'])} added")
+            if diff["removed_objects"]:
+                parts.append(f"{len(diff['removed_objects'])} removed")
+            if diff["modified_objects"]:
+                parts.append(f"{len(diff['modified_objects'])} modified")
+            if diff["added_materials"] or diff["removed_materials"] or diff["modified_materials"]:
+                mat_count = len(diff["added_materials"]) + len(diff["removed_materials"]) + len(diff["modified_materials"])
+                parts.append(f"{mat_count} material(s) changed")
+            if diff["camera_changes"]:
+                parts.append("camera changed")
+            if diff["light_changes"]:
+                parts.append("lights changed")
+            if diff["timeline_changes"]:
+                parts.append("timeline changed")
+            if diff["keyframe_changes"]:
+                parts.append("keyframes changed")
+
+            diff["has_changes"] = bool(parts)
+            diff["summary"] = ", ".join(parts) if parts else "No changes detected"
+
+            return diff
+        except Exception as e:
+            print(f"Error in diff_scene: {str(e)}")
+            traceback.print_exc()
+            return {"error": str(e)}
 
     def get_viewport_screenshot(self, max_size=800, filepath=None, format="png"):
         """

@@ -14,3 +14,10 @@ wheels/
 
 # Local config secrets
 src/blender_mcp/config.py
+
+# Claude Code
+.claude/
+
+# Blender files
+*.blend
+*.blend1

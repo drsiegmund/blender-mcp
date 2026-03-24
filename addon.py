@@ -372,7 +372,9 @@ class BlenderMCPServer:
     def _get_engine_id(self, engine_name):
         """Map engine name to Blender's internal engine identifier."""
         if engine_name.upper() == "EEVEE":
-            if bpy.app.version >= (4, 0, 0):
+            # Check which EEVEE identifier is available in this Blender version
+            engine_items = [e.identifier for e in bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items]
+            if "BLENDER_EEVEE_NEXT" in engine_items:
                 return "BLENDER_EEVEE_NEXT"
             return "BLENDER_EEVEE"
         return "CYCLES"

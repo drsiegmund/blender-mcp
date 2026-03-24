@@ -44,6 +44,7 @@ class BlenderMCPServer:
         self.socket = None
         self.server_thread = None
         self._last_snapshot = None
+        self._last_render_path = None
 
     def start(self):
         if self.running:
@@ -209,6 +210,7 @@ class BlenderMCPServer:
             "get_object_info": self.get_object_info,
             "snapshot_scene": self.snapshot_scene,
             "diff_scene": self.diff_scene,
+            "render_scene": self.render_scene,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
             "get_telemetry_consent": self.get_telemetry_consent,
@@ -366,6 +368,14 @@ class BlenderMCPServer:
 
     def _round_vec(self, vec, decimals=4):
         return [round(float(v), decimals) for v in vec]
+
+    def _get_engine_id(self, engine_name):
+        """Map engine name to Blender's internal engine identifier."""
+        if engine_name.upper() == "EEVEE":
+            if bpy.app.version >= (4, 0, 0):
+                return "BLENDER_EEVEE_NEXT"
+            return "BLENDER_EEVEE"
+        return "CYCLES"
 
     def _get_fcurves(self, action):
         """Get fcurves from an action, handling both layered (Blender 4.x) and legacy actions."""
@@ -649,6 +659,77 @@ class BlenderMCPServer:
 
         except Exception as e:
             return {"error": str(e)}
+
+    def render_scene(self, filepath=None, resolution_x=1280, resolution_y=720,
+                     engine="EEVEE", samples=None):
+        """Render the current scene and save to filepath."""
+        if not filepath:
+            return {"error": "No filepath provided"}
+
+        scene = bpy.context.scene
+        render = scene.render
+
+        # Save current settings
+        saved = {
+            "engine": render.engine,
+            "resolution_x": render.resolution_x,
+            "resolution_y": render.resolution_y,
+            "resolution_percentage": render.resolution_percentage,
+            "filepath": render.filepath,
+            "file_format": render.image_settings.file_format,
+            "eevee_samples": scene.eevee.taa_render_samples if hasattr(scene.eevee, 'taa_render_samples') else None,
+            "cycles_samples": scene.cycles.samples if hasattr(scene, 'cycles') else None,
+        }
+
+        try:
+            # Set render settings
+            engine_id = self._get_engine_id(engine)
+            render.engine = engine_id
+            render.resolution_x = resolution_x
+            render.resolution_y = resolution_y
+            render.resolution_percentage = 100
+            render.filepath = filepath
+            render.image_settings.file_format = 'PNG'
+
+            # Set samples (capped at 256)
+            if engine.upper() == "EEVEE":
+                s = min(samples or 32, 256)
+                if hasattr(scene.eevee, 'taa_render_samples'):
+                    scene.eevee.taa_render_samples = s
+            else:
+                s = min(samples or 64, 256)
+                scene.cycles.samples = s
+
+            # Render
+            print(f"Rendering with {engine_id}, {resolution_x}x{resolution_y}, {s} samples...")
+            bpy.ops.render.render(write_still=True)
+
+            self._last_render_path = filepath
+            print("Render complete")
+
+            return {
+                "success": True,
+                "filepath": filepath,
+                "width": resolution_x,
+                "height": resolution_y,
+                "engine": engine,
+            }
+        except Exception as e:
+            print(f"Error in render_scene: {str(e)}")
+            traceback.print_exc()
+            return {"error": str(e)}
+        finally:
+            # Restore settings
+            render.engine = saved["engine"]
+            render.resolution_x = saved["resolution_x"]
+            render.resolution_y = saved["resolution_y"]
+            render.resolution_percentage = saved["resolution_percentage"]
+            render.filepath = saved["filepath"]
+            render.image_settings.file_format = saved["file_format"]
+            if saved["eevee_samples"] is not None and hasattr(scene.eevee, 'taa_render_samples'):
+                scene.eevee.taa_render_samples = saved["eevee_samples"]
+            if saved["cycles_samples"] is not None and hasattr(scene, 'cycles'):
+                scene.cycles.samples = saved["cycles_samples"]
 
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""

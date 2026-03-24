@@ -113,7 +113,7 @@ class BlenderConnection:
         else:
             raise Exception("No data received")
 
-    def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+    def send_command(self, command_type: str, params: Dict[str, Any] = None, timeout: float = 180.0) -> Dict[str, Any]:
         """Send a command to Blender and return the response"""
         if not self.sock and not self.connect():
             raise ConnectionError("Not connected to Blender")
@@ -132,7 +132,7 @@ class BlenderConnection:
             logger.info(f"Command sent, waiting for response...")
             
             # Set a timeout for receiving - use the same timeout as in receive_full_response
-            self.sock.settimeout(180.0)  # Match the addon's timeout
+            self.sock.settimeout(timeout)
             
             # Receive the response using the improved receive_full_response method
             response_data = self.receive_full_response(self.sock)
@@ -215,6 +215,7 @@ mcp = FastMCP(
 # Global connection for resources (since resources can't access context)
 _blender_connection = None
 _polyhaven_enabled = False  # Add this global variable
+_last_render_path = None
 
 def get_blender_connection():
     """Get or create a persistent Blender connection"""
@@ -369,6 +370,127 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
     except Exception as e:
         logger.error(f"Error capturing screenshot: {str(e)}")
         raise Exception(f"Screenshot failed: {str(e)}")
+
+
+@telemetry_tool("render_scene")
+@mcp.tool()
+def render_scene(ctx: Context, resolution_x: int = 1280, resolution_y: int = 720,
+                 engine: str = "EEVEE", samples: int = None) -> Image:
+    """
+    Render the current Blender scene using the specified render engine.
+    Returns the rendered image. This performs a real render, not a viewport screenshot.
+
+    Parameters:
+    - resolution_x: Render width in pixels (default: 1280)
+    - resolution_y: Render height in pixels (default: 720)
+    - engine: Render engine - "EEVEE" or "CYCLES" (default: "EEVEE")
+    - samples: Number of render samples (default: 32 for EEVEE, 64 for Cycles)
+    """
+    global _last_render_path
+    try:
+        blender = get_blender_connection()
+
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, f"blender_render_{os.getpid()}.png")
+
+        params = {
+            "filepath": temp_path,
+            "resolution_x": resolution_x,
+            "resolution_y": resolution_y,
+            "engine": engine,
+        }
+        if samples is not None:
+            params["samples"] = samples
+
+        result = blender.send_command("render_scene", params, timeout=600)
+
+        if "error" in result:
+            raise Exception(result["error"])
+
+        if not os.path.exists(temp_path):
+            raise Exception("Render file was not created")
+
+        with open(temp_path, 'rb') as f:
+            image_bytes = f.read()
+
+        _last_render_path = temp_path
+
+        return Image(data=image_bytes, format="png")
+
+    except Exception as e:
+        logger.error(f"Error rendering scene: {str(e)}")
+        raise Exception(f"Render failed: {str(e)}")
+
+
+@telemetry_tool("review_render")
+@mcp.tool()
+def review_render(ctx: Context, source: str = "render", max_size: int = 1280) -> list:
+    """
+    Get the last render or a viewport screenshot for visual review, along with scene metadata.
+    Use this to analyze composition, lighting, materials, and suggest improvements.
+
+    Parameters:
+    - source: "render" to review the last render, "viewport" for a viewport screenshot (default: "render")
+    - max_size: Maximum image dimension in pixels (default: 1280)
+    """
+    global _last_render_path
+    try:
+        blender = get_blender_connection()
+
+        # Get image
+        if source == "render":
+            if not _last_render_path or not os.path.exists(_last_render_path):
+                raise Exception("No render available. Call render_scene first.")
+            with open(_last_render_path, 'rb') as f:
+                image_bytes = f.read()
+        elif source == "viewport":
+            temp_dir = tempfile.gettempdir()
+            temp_path = os.path.join(temp_dir, f"blender_review_{os.getpid()}.png")
+            result = blender.send_command("get_viewport_screenshot", {
+                "max_size": max_size,
+                "filepath": temp_path,
+                "format": "png"
+            })
+            if "error" in result:
+                raise Exception(result["error"])
+            with open(temp_path, 'rb') as f:
+                image_bytes = f.read()
+            os.remove(temp_path)
+        else:
+            raise Exception(f"Invalid source: {source}. Use 'render' or 'viewport'.")
+
+        # Get scene metadata
+        snapshot = blender.send_command("snapshot_scene")
+        obj_count = len(snapshot.get("objects", {}))
+        mat_names = list(snapshot.get("materials", {}).keys())
+        cameras = snapshot.get("cameras", {})
+        lights = snapshot.get("lights", {})
+        timeline = snapshot.get("timeline", {})
+
+        # Build compact metadata summary
+        light_summary = []
+        for name, data in lights.items():
+            light_summary.append(f"{name}: {data['light_type']}, energy={data['energy']}")
+
+        cam_summary = []
+        for name, data in cameras.items():
+            cam_summary.append(f"{name}: focal_length={data['focal_length']}mm")
+
+        metadata = (
+            f"Scene: {snapshot.get('scene_name', 'Unknown')}\n"
+            f"Objects: {obj_count}\n"
+            f"Materials: {', '.join(mat_names)}\n"
+            f"Lights: {'; '.join(light_summary) if light_summary else 'None'}\n"
+            f"Cameras: {'; '.join(cam_summary) if cam_summary else 'None'}\n"
+            f"Timeline: frame {timeline.get('frame_start')}-{timeline.get('frame_end')}, "
+            f"{timeline.get('fps')}fps"
+        )
+
+        return [Image(data=image_bytes, format="png"), metadata]
+
+    except Exception as e:
+        logger.error(f"Error reviewing render: {str(e)}")
+        raise Exception(f"Review failed: {str(e)}")
 
 
 @telemetry_tool("execute_blender_code")

@@ -328,6 +328,41 @@ def diff_scene(ctx: Context) -> str:
         logger.error(f"Error diffing scene: {str(e)}")
         return f"Error diffing scene: {str(e)}"
 
+@telemetry_tool("get_change_log")
+@mcp.tool()
+def get_change_log(ctx: Context, summary: bool = True) -> str:
+    """
+    Get the automatically collected scene change log. Changes are detected
+    via Blender's depsgraph_update_post handler and logged continuously while
+    the server is running. No need to take a snapshot first.
+
+    Parameters:
+    - summary: If true (default), returns aggregated changes per object.
+               If false, returns all individual change events.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_change_log", {"summary": summary})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting change log: {str(e)}")
+        return f"Error getting change log: {str(e)}"
+
+@telemetry_tool("clear_change_log")
+@mcp.tool()
+def clear_change_log(ctx: Context) -> str:
+    """
+    Clear the scene change log. Use this to reset the baseline after reviewing
+    changes, so that subsequent get_change_log calls only show new changes.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("clear_change_log")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error clearing change log: {str(e)}")
+        return f"Error clearing change log: {str(e)}"
+
 @telemetry_tool("get_viewport_screenshot")
 @mcp.tool()
 def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:

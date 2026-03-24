@@ -45,6 +45,15 @@ class BlenderMCPServer:
         self.server_thread = None
         self._last_snapshot = None
         self._last_render_path = None
+        self._change_log = []
+        self._change_log_enabled = False
+        self._depsgraph_handler = None
+
+    def _make_depsgraph_handler(self):
+        """Create a closure that captures self for use as a bpy.app.handlers callback."""
+        def handler(scene):
+            self._on_depsgraph_update(scene)
+        return handler
 
     def start(self):
         if self.running:
@@ -65,12 +74,23 @@ class BlenderMCPServer:
             self.server_thread.daemon = True
             self.server_thread.start()
 
+            # Register depsgraph change handler
+            self._depsgraph_handler = self._make_depsgraph_handler()
+            bpy.app.handlers.depsgraph_update_post.append(self._depsgraph_handler)
+            self._change_log_enabled = True
+
             print(f"BlenderMCP server started on {self.host}:{self.port}")
         except Exception as e:
             print(f"Failed to start server: {str(e)}")
             self.stop()
 
     def stop(self):
+        # Disable change log and remove depsgraph handler
+        self._change_log_enabled = False
+        if self._depsgraph_handler and self._depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.remove(self._depsgraph_handler)
+            self._depsgraph_handler = None
+
         self.running = False
 
         # Close socket
@@ -210,6 +230,8 @@ class BlenderMCPServer:
             "get_object_info": self.get_object_info,
             "snapshot_scene": self.snapshot_scene,
             "diff_scene": self.diff_scene,
+            "get_change_log": self.get_change_log,
+            "clear_change_log": self.clear_change_log,
             "render_scene": self.render_scene,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
@@ -604,6 +626,66 @@ class BlenderMCPServer:
             print(f"Error in diff_scene: {str(e)}")
             traceback.print_exc()
             return {"error": str(e)}
+
+    def _on_depsgraph_update(self, scene):
+        """Callback for depsgraph_update_post, logs scene changes."""
+        if not self._change_log_enabled:
+            return
+        try:
+            depsgraph = bpy.context.view_layer.depsgraph
+            from datetime import datetime
+            timestamp = datetime.now().isoformat(timespec='seconds')
+            for update in depsgraph.updates:
+                entry = {
+                    "timestamp": timestamp,
+                    "id_name": update.id.name,
+                    "id_type": type(update.id).__name__,
+                    "is_updated_transform": update.is_updated_transform,
+                    "is_updated_geometry": update.is_updated_geometry,
+                    "is_updated_shading": update.is_updated_shading,
+                }
+                self._change_log.append(entry)
+            if len(self._change_log) > 1000:
+                self._change_log = self._change_log[-1000:]
+        except Exception:
+            pass  # Never crash Blender from a handler
+
+    def get_change_log(self, since=None, summary=True):
+        """Return the accumulated change log, optionally filtered and summarized."""
+        try:
+            entries = self._change_log
+            if since:
+                entries = [e for e in entries if e["timestamp"] >= since]
+
+            if not summary:
+                return {"entry_count": len(entries), "entries": entries}
+
+            # Summary mode: group by object name
+            changed_objects = {}
+            for e in entries:
+                name = e["id_name"]
+                if name not in changed_objects:
+                    changed_objects[name] = {"type": e["id_type"], "transforms": 0, "geometry": 0, "shading": 0}
+                if e["is_updated_transform"]:
+                    changed_objects[name]["transforms"] += 1
+                if e["is_updated_geometry"]:
+                    changed_objects[name]["geometry"] += 1
+                if e["is_updated_shading"]:
+                    changed_objects[name]["shading"] += 1
+
+            return {
+                "entry_count": len(entries),
+                "changed_objects": changed_objects,
+                "summary": f"{len(changed_objects)} objects changed ({len(entries)} events)",
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def clear_change_log(self):
+        """Clear the change log and return the number of cleared entries."""
+        count = len(self._change_log)
+        self._change_log = []
+        return {"cleared": count}
 
     def get_viewport_screenshot(self, max_size=800, filepath=None, format="png"):
         """

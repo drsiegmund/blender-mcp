@@ -386,6 +386,9 @@ class BlenderMCPServer:
                 "polygons": len(mesh.polygons),
             }
 
+        obj_info["constraints"] = self._get_constraints(obj)
+        obj_info["modifiers"] = self._get_modifiers(obj)
+
         return obj_info
 
     def _round_vec(self, vec, decimals=4):
@@ -443,6 +446,74 @@ class BlenderMCPServer:
                 break
         return props
 
+    def _get_constraints(self, obj):
+        """Extract constraints from an object."""
+        constraints = []
+        for c in obj.constraints:
+            data = {
+                "name": c.name,
+                "type": c.type,
+                "enabled": not c.mute,
+                "target": c.target.name if hasattr(c, 'target') and c.target else None,
+                "params": {},
+            }
+            if hasattr(c, 'influence'):
+                data["params"]["influence"] = round(float(c.influence), 4)
+            if c.type == 'TRACK_TO':
+                data["params"]["track_axis"] = c.track_axis
+                data["params"]["up_axis"] = c.up_axis
+            elif c.type == 'FOLLOW_PATH':
+                data["params"]["offset"] = round(float(c.offset), 4)
+                data["params"]["use_fixed_location"] = c.use_fixed_location
+                data["params"]["forward_axis"] = c.forward_axis
+                data["params"]["up_axis"] = c.up_axis
+            elif c.type in ('COPY_LOCATION', 'COPY_ROTATION', 'COPY_SCALE'):
+                data["params"]["use_x"] = c.use_x
+                data["params"]["use_y"] = c.use_y
+                data["params"]["use_z"] = c.use_z
+            elif c.type == 'DAMPED_TRACK':
+                data["params"]["track_axis"] = c.track_axis
+            elif c.type == 'LOCKED_TRACK':
+                data["params"]["track_axis"] = c.track_axis
+                data["params"]["lock_axis"] = c.lock_axis
+            constraints.append(data)
+        return constraints
+
+    def _get_modifiers(self, obj):
+        """Extract modifiers from an object."""
+        modifiers = []
+        for m in obj.modifiers:
+            data = {
+                "name": m.name,
+                "type": m.type,
+                "show_render": m.show_render,
+                "show_viewport": m.show_viewport,
+                "params": {},
+            }
+            if m.type == 'SUBSURF':
+                data["params"]["levels"] = m.levels
+                data["params"]["render_levels"] = m.render_levels
+            elif m.type == 'ARRAY':
+                data["params"]["count"] = m.count
+                data["params"]["use_relative_offset"] = m.use_relative_offset
+                data["params"]["relative_offset_displace"] = self._round_vec(m.relative_offset_displace)
+            elif m.type == 'MIRROR':
+                data["params"]["use_axis"] = [m.use_axis[0], m.use_axis[1], m.use_axis[2]]
+            elif m.type == 'SOLIDIFY':
+                data["params"]["thickness"] = round(float(m.thickness), 4)
+                data["params"]["offset"] = round(float(m.offset), 4)
+            elif m.type == 'BEVEL':
+                data["params"]["width"] = round(float(m.width), 4)
+                data["params"]["segments"] = m.segments
+            elif m.type == 'BOOLEAN':
+                data["params"]["operation"] = m.operation
+                data["params"]["object"] = m.object.name if m.object else None
+            elif m.type == 'SHRINKWRAP':
+                data["params"]["target"] = m.target.name if m.target else None
+                data["params"]["wrap_method"] = m.wrap_method
+            modifiers.append(data)
+        return modifiers
+
     def _build_snapshot(self):
         """Build a complete snapshot of the current scene state."""
         from datetime import datetime
@@ -474,6 +545,8 @@ class BlenderMCPServer:
                 "children": [c.name for c in obj.children],
                 "materials": [slot.material.name for slot in obj.material_slots if slot.material],
                 "keyframes": self._get_keyframes(obj),
+                "constraints": self._get_constraints(obj),
+                "modifiers": self._get_modifiers(obj),
             }
             snapshot["objects"][obj.name] = obj_data
 
@@ -549,7 +622,7 @@ class BlenderMCPServer:
             diff["added_objects"] = sorted(new_objs - old_objs)
             diff["removed_objects"] = sorted(old_objs - new_objs)
 
-            obj_props = ["location", "rotation", "scale", "visible", "parent", "materials"]
+            obj_props = ["location", "rotation", "scale", "visible", "parent", "materials", "constraints", "modifiers"]
             for name in old_objs & new_objs:
                 changes = self._diff_dicts(old["objects"][name], current["objects"][name], obj_props)
                 if changes:

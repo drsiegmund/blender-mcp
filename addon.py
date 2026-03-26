@@ -48,6 +48,12 @@ class BlenderMCPServer:
         self._change_log = []
         self._change_log_enabled = False
         self._depsgraph_handler = None
+        self._render_status = None
+        self._render_result = None
+        self._render_id = None
+        self._batch_status = None
+        self._batch_result = None
+        self._batch_id = None
 
     def _make_depsgraph_handler(self):
         """Create a closure that captures self for use as a bpy.app.handlers callback."""
@@ -233,6 +239,9 @@ class BlenderMCPServer:
             "get_change_log": self.get_change_log,
             "clear_change_log": self.clear_change_log,
             "render_scene": self.render_scene,
+            "poll_render_status": self.poll_render_status,
+            "execute_batch_script": self.execute_batch_script,
+            "poll_batch_status": self.poll_batch_status,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
             "get_telemetry_consent": self.get_telemetry_consent,
@@ -819,9 +828,13 @@ class BlenderMCPServer:
 
     def render_scene(self, filepath=None, resolution_x=1280, resolution_y=720,
                      engine="EEVEE", samples=None):
-        """Render the current scene and save to filepath."""
+        """Start an async render and return immediately."""
+        import uuid as _uuid
         if not filepath:
             return {"error": "No filepath provided"}
+
+        if self._render_status == "rendering":
+            return {"error": "A render is already in progress", "render_id": self._render_id}
 
         scene = bpy.context.scene
         render = scene.render
@@ -838,55 +851,114 @@ class BlenderMCPServer:
             "cycles_samples": scene.cycles.samples if hasattr(scene, 'cycles') else None,
         }
 
-        try:
-            # Set render settings
-            engine_id = self._get_engine_id(engine)
-            render.engine = engine_id
-            render.resolution_x = resolution_x
-            render.resolution_y = resolution_y
-            render.resolution_percentage = 100
-            render.filepath = filepath
-            render.image_settings.file_format = 'PNG'
+        # Set render settings
+        engine_id = self._get_engine_id(engine)
+        render.engine = engine_id
+        render.resolution_x = resolution_x
+        render.resolution_y = resolution_y
+        render.resolution_percentage = 100
+        render.filepath = filepath
+        render.image_settings.file_format = 'PNG'
 
-            # Set samples (capped at 256)
-            if engine.upper() == "EEVEE":
-                s = min(samples or 32, 256)
-                if hasattr(scene.eevee, 'taa_render_samples'):
-                    scene.eevee.taa_render_samples = s
-            else:
-                s = min(samples or 64, 256)
-                scene.cycles.samples = s
+        if engine.upper() == "EEVEE":
+            s = min(samples or 32, 256)
+            if hasattr(scene.eevee, 'taa_render_samples'):
+                scene.eevee.taa_render_samples = s
+        else:
+            s = min(samples or 64, 256)
+            scene.cycles.samples = s
 
-            # Render
-            print(f"Rendering with {engine_id}, {resolution_x}x{resolution_y}, {s} samples...")
-            bpy.ops.render.render(write_still=True)
+        # Set async render state
+        self._render_id = str(_uuid.uuid4())
+        self._render_status = "rendering"
+        self._render_result = None
 
-            self._last_render_path = filepath
-            print("Render complete")
+        server_ref = self
 
-            return {
-                "success": True,
-                "filepath": filepath,
-                "width": resolution_x,
-                "height": resolution_y,
-                "engine": engine,
-            }
-        except Exception as e:
-            print(f"Error in render_scene: {str(e)}")
-            traceback.print_exc()
-            return {"error": str(e)}
-        finally:
-            # Restore settings
-            render.engine = saved["engine"]
-            render.resolution_x = saved["resolution_x"]
-            render.resolution_y = saved["resolution_y"]
-            render.resolution_percentage = saved["resolution_percentage"]
-            render.filepath = saved["filepath"]
-            render.image_settings.file_format = saved["file_format"]
-            if saved["eevee_samples"] is not None and hasattr(scene.eevee, 'taa_render_samples'):
-                scene.eevee.taa_render_samples = saved["eevee_samples"]
-            if saved["cycles_samples"] is not None and hasattr(scene, 'cycles'):
-                scene.cycles.samples = saved["cycles_samples"]
+        def _do_render():
+            try:
+                print(f"Rendering with {engine_id}, {resolution_x}x{resolution_y}, {s} samples...")
+                bpy.ops.render.render(write_still=True)
+                server_ref._render_status = "completed"
+                server_ref._render_result = {
+                    "filepath": filepath, "width": resolution_x,
+                    "height": resolution_y, "engine": engine,
+                }
+                server_ref._last_render_path = filepath
+                print("Render complete")
+            except Exception as e:
+                server_ref._render_status = "failed"
+                server_ref._render_result = {"error": str(e)}
+                print(f"Render failed: {str(e)}")
+            finally:
+                render.engine = saved["engine"]
+                render.resolution_x = saved["resolution_x"]
+                render.resolution_y = saved["resolution_y"]
+                render.resolution_percentage = saved["resolution_percentage"]
+                render.filepath = saved["filepath"]
+                render.image_settings.file_format = saved["file_format"]
+                if saved["eevee_samples"] is not None and hasattr(scene.eevee, 'taa_render_samples'):
+                    scene.eevee.taa_render_samples = saved["eevee_samples"]
+                if saved["cycles_samples"] is not None and hasattr(scene, 'cycles'):
+                    scene.cycles.samples = saved["cycles_samples"]
+            return None
+
+        bpy.app.timers.register(_do_render, first_interval=0.1)
+
+        return {"status": "started", "render_id": self._render_id}
+
+    def poll_render_status(self):
+        """Poll the status of an async render."""
+        return {
+            "render_id": self._render_id,
+            "status": self._render_status or "idle",
+            "result": self._render_result,
+        }
+
+    def execute_batch_script(self, script_path=None, code=None):
+        """Execute a long-running script asynchronously."""
+        import uuid as _uuid
+        if self._batch_status == "running":
+            return {"error": "A batch script is already running", "batch_id": self._batch_id}
+
+        if code:
+            script_code = code
+        elif script_path:
+            with open(script_path, 'r') as f:
+                script_code = f.read()
+        else:
+            return {"error": "No code or script_path provided"}
+
+        self._batch_id = str(_uuid.uuid4())
+        self._batch_status = "running"
+        self._batch_result = None
+
+        server_ref = self
+
+        def _do_execute():
+            try:
+                namespace = {"bpy": bpy}
+                capture_buffer = io.StringIO()
+                with redirect_stdout(capture_buffer):
+                    exec(script_code, namespace)
+                server_ref._batch_status = "completed"
+                server_ref._batch_result = {"output": capture_buffer.getvalue()}
+            except Exception as e:
+                server_ref._batch_status = "failed"
+                server_ref._batch_result = {"error": str(e)}
+            return None
+
+        bpy.app.timers.register(_do_execute, first_interval=0.1)
+
+        return {"status": "started", "batch_id": self._batch_id}
+
+    def poll_batch_status(self):
+        """Poll the status of an async batch script."""
+        return {
+            "batch_id": self._batch_id,
+            "status": self._batch_status or "idle",
+            "result": self._batch_result,
+        }
 
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""

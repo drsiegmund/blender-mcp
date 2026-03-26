@@ -57,11 +57,10 @@ class BlenderConnection:
             finally:
                 self.sock = None
 
-    def receive_full_response(self, sock, buffer_size=8192):
+    def receive_full_response(self, sock, buffer_size=8192, timeout=180.0):
         """Receive the complete response, potentially in multiple chunks"""
         chunks = []
-        # Use a consistent timeout value that matches the addon's timeout
-        sock.settimeout(180.0)  # Match the addon's timeout
+        sock.settimeout(timeout)
         
         try:
             while True:
@@ -135,7 +134,7 @@ class BlenderConnection:
             self.sock.settimeout(timeout)
             
             # Receive the response using the improved receive_full_response method
-            response_data = self.receive_full_response(self.sock)
+            response_data = self.receive_full_response(self.sock, timeout=timeout)
             logger.info(f"Received {len(response_data)} bytes of data")
             
             response = json.loads(response_data.decode('utf-8'))
@@ -410,10 +409,11 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
 @telemetry_tool("render_scene")
 @mcp.tool()
 def render_scene(ctx: Context, resolution_x: int = 1280, resolution_y: int = 720,
-                 engine: str = "EEVEE", samples: int = None) -> Image:
+                 engine: str = "EEVEE", samples: int = None) -> str:
     """
-    Render the current Blender scene using the specified render engine.
-    Returns the rendered image. This performs a real render, not a viewport screenshot.
+    Start an asynchronous render of the current Blender scene.
+    Returns immediately with a render ID. Use poll_render_status to check
+    progress and retrieve the rendered image when complete.
 
     Parameters:
     - resolution_x: Render width in pixels (default: 1280)
@@ -421,7 +421,6 @@ def render_scene(ctx: Context, resolution_x: int = 1280, resolution_y: int = 720
     - engine: Render engine - "EEVEE" or "CYCLES" (default: "EEVEE")
     - samples: Number of render samples (default: 32 for EEVEE, 64 for Cycles)
     """
-    global _last_render_path
     try:
         blender = get_blender_connection()
 
@@ -437,24 +436,96 @@ def render_scene(ctx: Context, resolution_x: int = 1280, resolution_y: int = 720
         if samples is not None:
             params["samples"] = samples
 
-        result = blender.send_command("render_scene", params, timeout=600)
+        result = blender.send_command("render_scene", params, timeout=30)
 
         if "error" in result:
             raise Exception(result["error"])
 
-        if not os.path.exists(temp_path):
-            raise Exception("Render file was not created")
-
-        with open(temp_path, 'rb') as f:
-            image_bytes = f.read()
-
-        _last_render_path = temp_path
-
-        return Image(data=image_bytes, format="png")
+        return json.dumps(result, indent=2)
 
     except Exception as e:
-        logger.error(f"Error rendering scene: {str(e)}")
-        raise Exception(f"Render failed: {str(e)}")
+        logger.error(f"Error starting render: {str(e)}")
+        return f"Error starting render: {str(e)}"
+
+
+@telemetry_tool("poll_render_status")
+@mcp.tool()
+def poll_render_status(ctx: Context) -> list:
+    """
+    Poll the status of an asynchronous render started with render_scene.
+    Returns the render status. When the render is complete, returns the
+    rendered image along with render metadata.
+
+    Call this after render_scene to check progress and retrieve the result.
+    """
+    global _last_render_path
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("poll_render_status")
+
+        status = result.get("status", "idle")
+
+        if status == "completed":
+            render_result = result.get("result", {})
+            filepath = render_result.get("filepath")
+            if filepath and os.path.exists(filepath):
+                with open(filepath, 'rb') as f:
+                    image_bytes = f.read()
+                _last_render_path = filepath
+                return [Image(data=image_bytes, format="png"),
+                        json.dumps(render_result, indent=2)]
+            return [json.dumps({"status": "completed", "note": "Render file not found"}, indent=2)]
+
+        if status == "failed":
+            return [json.dumps(result, indent=2)]
+
+        return [json.dumps(result, indent=2)]
+
+    except Exception as e:
+        logger.error(f"Error polling render status: {str(e)}")
+        return [f"Error polling render status: {str(e)}"]
+
+
+@telemetry_tool("execute_batch_script")
+@mcp.tool()
+def execute_batch_script(ctx: Context, code: str = "") -> str:
+    """
+    Execute a long-running Python script in Blender asynchronously.
+    Returns immediately with a batch ID. Use poll_batch_status to check
+    progress and retrieve the result when complete.
+
+    Parameters:
+    - code: The Python code to execute asynchronously in Blender
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("execute_batch_script", {"code": code}, timeout=30)
+
+        if "error" in result:
+            raise Exception(result["error"])
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        logger.error(f"Error starting batch script: {str(e)}")
+        return f"Error starting batch script: {str(e)}"
+
+
+@telemetry_tool("poll_batch_status")
+@mcp.tool()
+def poll_batch_status(ctx: Context) -> str:
+    """
+    Poll the status of an asynchronous batch script started with execute_batch_script.
+    Returns the script status and output when complete.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("poll_batch_status")
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        logger.error(f"Error polling batch status: {str(e)}")
+        return f"Error polling batch status: {str(e)}"
 
 
 @telemetry_tool("review_render")

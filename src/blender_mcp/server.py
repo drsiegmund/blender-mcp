@@ -545,9 +545,22 @@ def review_render(ctx: Context, source: str = "render", max_size: int = 1280) ->
 
         # Get image
         if source == "render":
-            if not _last_render_path or not os.path.exists(_last_render_path):
-                raise Exception("No render available. Call render_scene first.")
-            with open(_last_render_path, 'rb') as f:
+            # Try _last_render_path first, fall back to polling render status
+            render_path = _last_render_path
+            if not render_path or not os.path.exists(render_path):
+                # Check if there's a completed async render
+                try:
+                    status = blender.send_command("poll_render_status")
+                    if status.get("status") == "completed":
+                        render_result = status.get("result", {})
+                        render_path = render_result.get("filepath")
+                        if render_path and os.path.exists(render_path):
+                            _last_render_path = render_path
+                except Exception:
+                    pass
+            if not render_path or not os.path.exists(render_path):
+                raise Exception("No render available. Call render_scene and poll_render_status first.")
+            with open(render_path, 'rb') as f:
                 image_bytes = f.read()
         elif source == "viewport":
             temp_dir = tempfile.gettempdir()

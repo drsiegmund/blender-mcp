@@ -85,6 +85,15 @@ class BlenderMCPServer:
             bpy.app.handlers.depsgraph_update_post.append(self._depsgraph_handler)
             self._change_log_enabled = True
 
+            # Set viewport to Material Preview for better visual feedback
+            for area in bpy.context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    for space in area.spaces:
+                        if space.type == 'VIEW_3D':
+                            space.shading.type = 'MATERIAL'
+                            break
+                    break
+
             print(f"BlenderMCP server started on {self.host}:{self.port}")
         except Exception as e:
             print(f"Failed to start server: {str(e)}")

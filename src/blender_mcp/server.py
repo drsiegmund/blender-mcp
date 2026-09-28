@@ -923,6 +923,53 @@ def plot_trajectory(ctx: Context, name: str, points: List[Any] = None, ode: List
         return f"Error plotting trajectory: {str(e)}"
 
 
+@telemetry_tool("list_renders")
+@mcp.tool()
+def list_renders(ctx: Context) -> str:
+    """
+    List the render history: the last 20 finished renders and animation previews,
+    numbered in order, with type, engine, size, frame and time. Use the numbers
+    (or negative indices, -1 = latest) with compare_renders.
+    """
+    try:
+        blender = get_blender_connection()
+        return json.dumps(blender.send_command("list_renders"), indent=2)
+    except Exception as e:
+        logger.error(f"Error listing renders: {str(e)}")
+        return f"Error listing renders: {str(e)}"
+
+
+@telemetry_tool("compare_renders")
+@mcp.tool()
+def compare_renders(ctx: Context, before: int = -2, after: int = -1, threshold: float = 0.02) -> list:
+    """
+    Compare two renders from the history side by side: before | after | difference
+    (changed pixels in red). Returns the image plus statistics: fraction of changed
+    pixels, mean/max difference and the bounding box of the change (pixels, top-left
+    origin). Use after an iteration of the render feedback loop to see what an
+    improvement actually changed.
+
+    Parameters:
+    - before: Render number, or negative index into the history (default: -2, the previous one)
+    - after: Render number, or negative index (default: -1, the latest)
+    - threshold: Per-pixel difference (0-1) above which a pixel counts as changed
+    """
+    try:
+        blender = get_blender_connection()
+        temp_path = os.path.join(tempfile.gettempdir(), f"blender_compare_{os.getpid()}.png")
+        result = blender.send_command("compare_renders", {"before": before, "after": after,
+                                                          "threshold": threshold, "filepath": temp_path})
+        if "error" in result:
+            raise Exception(result["error"])
+        with open(temp_path, "rb") as f:
+            image_bytes = f.read()
+        os.remove(temp_path)
+        return [Image(data=image_bytes, format="png"), json.dumps(result, indent=2)]
+    except Exception as e:
+        logger.error(f"Error comparing renders: {str(e)}")
+        return [f"Error comparing renders: {str(e)}"]
+
+
 @telemetry_tool("review_render")
 @mcp.tool()
 def review_render(ctx: Context, source: str = "render", max_size: int = 1280) -> list:

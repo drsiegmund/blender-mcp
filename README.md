@@ -17,8 +17,10 @@ snapshot_scene → make changes → diff_scene → see what changed
 Trigger real Blender renders (EEVEE or Cycles) from Claude and get visual feedback. `render_scene` returns immediately; the result is fetched with `poll_render_status`. Claude sees the rendered image alongside scene metadata and can suggest improvements to composition, lighting, and materials.
 
 ```
-render_scene → poll_render_status → review_render → apply feedback → render again
+render_scene → poll_render_status → review_render → apply feedback → render again → compare_renders
 ```
+
+`compare_renders` puts the previous and the latest render side by side with a difference image, so each iteration shows what actually changed.
 
 ### Depsgraph Change Detection
 A background handler (`depsgraph_update_post`) continuously logs scene changes while the MCP server runs. No snapshot needed — just ask what changed.
@@ -66,6 +68,8 @@ Snapshots and diffs now capture object constraints (Track To, Follow Path, Copy 
 | `clear_change_log` | Reset the change log |
 | `render_scene` | Start an async render with EEVEE/Cycles (configurable resolution, samples) |
 | `poll_render_status` | Check the async render; returns the image when complete |
+| `list_renders` | Numbered history of the last 20 renders |
+| `compare_renders` | Before / after / difference image with change statistics |
 | `review_render` | Get last render or viewport screenshot with scene metadata |
 | `insert_keyframes` | Insert keyframes with values and interpolation |
 | `delete_keyframes` | Delete keyframes by property, frame or component |
@@ -119,7 +123,7 @@ In Claude Code, ask Claude to run `get_scene_info` — if it returns your scene 
 ## Roadmap
 
 - **Scientific visualization** — Parametric surfaces, LaTeX labels, color legends, physics simulations (particles, fluids, rigid bodies)
-- **Feedback loop** — Scene checkpoints and before/after render comparison
+- **Feedback loop** — Scene checkpoints (save/restore)
 - **Cowork integration** — Multi-user collaborative sessions with shared scene state
 
 ## Stack

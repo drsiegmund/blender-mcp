@@ -55,6 +55,7 @@ class BlenderMCPServer:
         self._batch_result = None
         self._batch_id = None
         self._preview_job = None
+        self._render_history = []
 
     def _make_depsgraph_handler(self):
         """Create a closure that captures self for use as a bpy.app.handlers callback."""
@@ -251,6 +252,8 @@ class BlenderMCPServer:
             "render_scene": self.render_scene,
             "poll_render_status": self.poll_render_status,
             "render_animation_preview": self.render_animation_preview,
+            "list_renders": self.list_renders,
+            "compare_renders": self.compare_renders,
             "execute_batch_script": self.execute_batch_script,
             "poll_batch_status": self.poll_batch_status,
             "insert_keyframes": self.insert_keyframes,
@@ -943,6 +946,9 @@ class BlenderMCPServer:
                     "height": resolution_y, "engine": engine,
                 }
                 server_ref._last_render_path = filepath
+                with suppress(OSError):  # history is best effort; the render itself succeeded
+                    server_ref._remember_render(filepath, {"type": "render", "engine": engine,
+                                                           "width": resolution_x, "height": resolution_y})
                 print("Render complete")
             except Exception as e:
                 server_ref._render_status = "failed"
@@ -955,6 +961,116 @@ class BlenderMCPServer:
         bpy.app.timers.register(_do_render, first_interval=0.1)
 
         return {"status": "started", "render_id": self._render_id}
+
+    # ---- Render history & comparison ----
+
+    _RENDER_HISTORY_SIZE = 20
+
+    def _history_dir(self):
+        path = os.path.join(tempfile.gettempdir(), f"blender_mcp_history_{os.getpid()}")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _remember_render(self, filepath, info):
+        """Keep a copy of a finished render so later renders don't overwrite it."""
+        from datetime import datetime
+        number = self._render_history[-1]["number"] + 1 if self._render_history else 1
+        copy_path = os.path.join(self._history_dir(), f"render_{number:03d}.png")
+        shutil.copyfile(filepath, copy_path)
+        entry = dict(info, number=number, filepath=copy_path,
+                     time=datetime.now().isoformat(timespec="seconds"),
+                     frame=bpy.context.scene.frame_current)
+        self._render_history.append(entry)
+        while len(self._render_history) > self._RENDER_HISTORY_SIZE:
+            old = self._render_history.pop(0)
+            with suppress(OSError):
+                os.remove(old["filepath"])
+        return entry
+
+    def list_renders(self):
+        return {"renders": [{k: v for k, v in e.items() if k != "filepath"} for e in self._render_history]}
+
+    def _find_render(self, ref):
+        """ref: render number (>= 1) or negative index into the history (-1 = latest)."""
+        ref = int(ref)
+        if ref < 0:
+            if -ref > len(self._render_history):
+                raise ValueError(f"Only {len(self._render_history)} render(s) in the history")
+            return self._render_history[ref]
+        for entry in self._render_history:
+            if entry["number"] == ref:
+                return entry
+        raise ValueError(f"Render #{ref} is not in the history (see list_renders)")
+
+    def _load_rgba(self, path):
+        import numpy as np
+        img = bpy.data.images.load(path, check_existing=False)
+        try:
+            w, h = img.size
+            buf = np.empty(w * h * 4, dtype=np.float32)
+            img.pixels.foreach_get(buf)
+            return buf.reshape(h, w, 4)
+        finally:
+            bpy.data.images.remove(img)
+
+    def compare_renders(self, before=-2, after=-1, filepath=None, threshold=0.02):
+        """Compose before | after | difference and measure how much changed."""
+        import numpy as np
+        if not filepath:
+            return {"error": "No filepath provided"}
+        a_entry, b_entry = self._find_render(before), self._find_render(after)
+        a, b = self._load_rgba(a_entry["filepath"]), self._load_rgba(b_entry["filepath"])
+        if a.shape != b.shape:
+            # Nearest-neighbour resize of "before" to the size of "after"
+            ys = (np.arange(b.shape[0]) * a.shape[0] / b.shape[0]).astype(int)
+            xs = (np.arange(b.shape[1]) * a.shape[1] / b.shape[1]).astype(int)
+            a = a[ys][:, xs]
+
+        diff = np.abs(a[..., :3] - b[..., :3]).mean(axis=2)
+        changed = diff > threshold
+        gray = b[..., :3].mean(axis=2, keepdims=True) * 0.35
+        heat = np.clip(diff / max(float(diff.max()), threshold * 5), 0, 1)[..., None]
+        diff_panel = np.concatenate([gray * (1 - heat) + heat * np.array([1.0, 0.1, 0.1]),
+                                     np.ones(diff.shape + (1,))], axis=2)
+
+        h, w = b.shape[:2]
+        gap = 4
+        sheet = np.empty((h + 2 * gap, 3 * w + 4 * gap, 4), dtype=np.float32)
+        sheet[:] = (0.15, 0.15, 0.15, 1.0)
+        label_scale = max(2, h // 60)
+        for i, (panel, label) in enumerate([(a, str(a_entry["number"])), (b, str(b_entry["number"])),
+                                            (diff_panel, None)]):
+            tile = panel.astype(np.float32).copy()
+            tile[..., 3] = 1.0
+            if label:
+                self._draw_label(tile, label, label_scale)
+            x0 = gap + i * (w + gap)
+            sheet[gap:gap + h, x0:x0 + w] = tile
+
+        out = bpy.data.images.new("MCP_Compare", sheet.shape[1], sheet.shape[0], alpha=True)
+        try:
+            out.pixels.foreach_set(sheet.ravel())
+            out.filepath_raw = filepath
+            out.file_format = 'PNG'
+            out.save()
+        finally:
+            bpy.data.images.remove(out)
+
+        result = {
+            "filepath": filepath,
+            "before": {k: v for k, v in a_entry.items() if k != "filepath"},
+            "after": {k: v for k, v in b_entry.items() if k != "filepath"},
+            "layout": "before | after | difference (red = changed); panels labeled with render numbers",
+            "changed_fraction": round(float(changed.mean()), 4),
+            "mean_difference": round(float(diff.mean()), 4),
+            "max_difference": round(float(diff.max()), 4),
+        }
+        if changed.any():
+            rows, cols = np.nonzero(changed)
+            # Image rows are stored bottom-up; report the box with a top-left origin
+            result["changed_bbox"] = {"x_min": int(cols.min()), "x_max": int(cols.max()),
+                                      "y_min": int(h - 1 - rows.max()), "y_max": int(h - 1 - rows.min())}
+        return result
 
     # ---- Animation preview (contact sheet) ----
 
@@ -1111,6 +1227,8 @@ class BlenderMCPServer:
                 "layout": "row-major, top-left first; each tile is labeled with its frame number",
             }
             self._last_render_path = job["filepath"]
+            with suppress(OSError):
+                self._remember_render(job["filepath"], {"type": "animation_preview", "frames": job["frames"]})
         except Exception as e:
             traceback.print_exc()
             self._render_status = "failed"

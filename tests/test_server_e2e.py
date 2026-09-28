@@ -83,3 +83,15 @@ def test_visualization_tools_roundtrip(blender):
     assert r["animation"]["markers"] == ["Lorenz_marker_0"]
     assert S.plot_vector_field(None, name="Bad", field=["os", "0", "0"],
                                bounds=[[0, 1], [0, 1], [0, 0]]).startswith("Error")
+
+
+def test_compare_renders_roundtrip(blender):
+    for _ in range(2):
+        S.render_animation_preview(None, num_frames=1, resolution_x=32, resolution_y=18,
+                                   engine="CYCLES", samples=1)
+        S.poll_render_status(None)
+    renders = json.loads(S.list_renders(None))["renders"]
+    assert len(renders) >= 2 and renders[-1]["type"] == "animation_preview"
+    image, stats = S.compare_renders(None)
+    assert type(image).__name__ == "Image"
+    assert json.loads(stats)["after"]["number"] == renders[-1]["number"]

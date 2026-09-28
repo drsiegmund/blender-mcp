@@ -50,6 +50,9 @@ python -m pytest tests
 - **`poll_render_status`** — Checks the async render started by `render_scene`. Returns the status (`rendering`, `completed`, `failed`, `idle`) and, once complete, the rendered image plus metadata.
 - **`review_render`** — Returns the last render or a viewport screenshot together with scene metadata (object count, materials, lights, cameras, timeline). Designed for Claude Vision to analyze composition, lighting, and suggest improvements. Falls back to the result of the last async render if no render path is cached.
 
+- **`list_renders`** — Lists the render history: every finished `render_scene` and `render_animation_preview` is copied into a per-session history (last 20), numbered in order.
+- **`compare_renders`** — Shows two renders from the history as before | after | difference (changed pixels in red) and returns the changed fraction, mean/max difference and the bounding box of the change. Defaults compare the previous with the latest render. Different sizes are resampled.
+
 ### Depsgraph Change Detection
 
 - **`get_change_log`** — Returns automatically collected scene changes. A `depsgraph_update_post` handler runs in the background while the server is active, logging transform, geometry, and shading updates per object. Summary mode (default) aggregates events; detail mode returns raw entries.
@@ -101,10 +104,10 @@ Expressions are compiled with a whitelist of numpy functions (`sin`, `exp`, `sqr
 2. Make modifications (via `execute_blender_code`, the animation tools, or manually in Blender)
 3. **Diff** to see exactly what changed (`diff_scene`) or check the automatic **change log** (`get_change_log`)
 4. **Render** the scene (`render_scene`, then `poll_render_status` until complete) and **review** it (`review_render`) — Claude sees the image and provides feedback on composition, lighting, materials. For animations, use `render_animation_preview` to review motion as a contact sheet
-5. Iterate: apply improvements, render again, compare
+5. Iterate: apply improvements, render again, and check the effect with `compare_renders`
 6. **Clear** the change log when satisfied (`clear_change_log`)
 
 ## Roadmap
 
 - **Scientific visualization** — Done: vector fields and ODE trajectories. Next ideas: parametric surfaces and function graphs, LaTeX labels in 3D, color legends, physics simulations (particles, fluids, rigid bodies)
-- **Feedback loop** — Scene checkpoints (save/restore) and `compare_renders` (before/after with difference image)
+- **Feedback loop** — Scene checkpoints (save/restore); needs testing in a real Blender because restoring reloads the file

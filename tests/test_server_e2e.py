@@ -71,3 +71,15 @@ def test_nla_tools_roundtrip(blender):
     assert r["nla_tracks"][0]["strips"][1]["frame_start"] == 50
     assert json.loads(S.set_nla_track(None, object_name="Cube", track_name="Base", mute=True))["nla_tracks"][0]["mute"]
     assert json.loads(S.remove_nla(None, object_name="Cube", track_name="Base"))["nla_tracks"] == []
+
+
+def test_visualization_tools_roundtrip(blender):
+    r = json.loads(S.plot_vector_field(None, name="Rot", field=["-y", "x", "0"],
+                                       bounds=[[-1, 1], [-1, 1], [0, 0]], resolution=[4, 4, 1], mode="both"))
+    assert r["objects"] == ["Rot", "Rot_streamlines"]
+    r = json.loads(S.plot_trajectory(None, name="Lorenz", ode=["s*(y-x)", "x*(28-z)-y", "x*y-2.667*z"],
+                                     params={"s": 10}, initial=[1, 1, 1], t_span=[0, 5], steps=500,
+                                     fit_size=4, animate=True, frame_start=1, frame_end=20))
+    assert r["animation"]["markers"] == ["Lorenz_marker_0"]
+    assert S.plot_vector_field(None, name="Bad", field=["os", "0", "0"],
+                               bounds=[[0, 1], [0, 1], [0, 0]]).startswith("Error")

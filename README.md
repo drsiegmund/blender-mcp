@@ -36,6 +36,14 @@ insert_keyframes → set_timeline → scrub_timeline → render_animation_previe
 
 `render_animation_preview` renders evenly spaced frames into one labeled contact sheet, so Claude can judge the motion in a single image. NLA tools (`push_action_to_nla`, `add_nla_strip`, `update_nla_strip`, `set_nla_track`, `remove_nla`) layer and sequence actions.
 
+### Scientific Visualization
+Plot vector fields (arrows colored by magnitude, field lines) and ODE trajectories straight from formulas — e.g. the field lines of a magnetic dipole or two diverging trajectories of the Lorenz attractor, optionally animated.
+
+```
+plot_vector_field(field=["-y", "x", "0"], ...)  →  render_scene  →  review_render
+plot_trajectory(ode=["sigma*(y-x)", "x*(rho-z)-y", "x*y-beta*z"], animate=True, ...)
+```
+
 ### Constraints & Modifiers
 Snapshots and diffs now capture object constraints (Track To, Follow Path, Copy Location, etc.) and modifiers (Subdivision, Array, Mirror, Solidify, etc.) with type-specific parameters. Essential for animation workflows where camera paths are driven by constraints.
 
@@ -70,6 +78,8 @@ Snapshots and diffs now capture object constraints (Track To, Follow Path, Copy 
 | `update_nla_strip` | Move or change an NLA strip |
 | `set_nla_track` | Mute, solo or rename an NLA track |
 | `remove_nla` | Remove an NLA strip or track |
+| `plot_vector_field` | Vector field as colored arrows and/or streamlines |
+| `plot_trajectory` | Trajectories from points or an ODE (RK4), optionally animated |
 | `get_scene_info` | Quick scene overview (object count, materials) |
 | `get_object_info` | Detailed info for a single object (incl. constraints, modifiers) |
 | `get_viewport_screenshot` | Capture the 3D viewport |
@@ -108,7 +118,8 @@ In Claude Code, ask Claude to run `get_scene_info` — if it returns your scene 
 
 ## Roadmap
 
-- **Scientific visualization** — Magnetic fields, force fields, particle systems, fluid simulations, rigid body dynamics
+- **Scientific visualization** — Parametric surfaces, LaTeX labels, color legends, physics simulations (particles, fluids, rigid bodies)
+- **Feedback loop** — Scene checkpoints and before/after render comparison
 - **Cowork integration** — Multi-user collaborative sessions with shared scene state
 
 ## Stack

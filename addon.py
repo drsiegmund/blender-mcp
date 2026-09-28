@@ -263,6 +263,8 @@ class BlenderMCPServer:
             "update_nla_strip": self.update_nla_strip,
             "remove_nla": self.remove_nla,
             "set_nla_track": self.set_nla_track,
+            "plot_vector_field": self.plot_vector_field,
+            "plot_trajectory": self.plot_trajectory,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
             "get_telemetry_consent": self.get_telemetry_consent,
@@ -1619,6 +1621,452 @@ class BlenderMCPServer:
         if name:
             track.name = name
         return self._nla_result(obj, owner)
+
+    # ---- Scientific visualization ----
+
+    # viridis at 0, 0.25, 0.5, 0.75, 1, converted from sRGB to linear RGB
+    _VIRIDIS = [
+        (0.0, (0.0580, 0.0004, 0.0887)),
+        (0.25, (0.0431, 0.0848, 0.2588)),
+        (0.5, (0.0148, 0.2813, 0.2639)),
+        (0.75, (0.1123, 0.5852, 0.1212)),
+        (1.0, (0.9847, 0.7997, 0.0182)),
+    ]
+
+    _EXPR_FUNCS = (
+        "sin", "cos", "tan", "arcsin", "arccos", "arctan", "arctan2", "sinh", "cosh",
+        "tanh", "exp", "log", "log10", "sqrt", "abs", "sign", "minimum", "maximum",
+        "where", "hypot", "floor", "ceil",
+    )
+
+    def _expr_namespace(self, variables, params):
+        import numpy as np
+        ns = {name: getattr(np, name) for name in self._EXPR_FUNCS}
+        ns.update({"pi": np.pi, "e": np.e})
+        for key, value in (params or {}).items():
+            if not str(key).isidentifier() or key in ns or key in variables:
+                raise ValueError(f"Invalid or reserved parameter name: {key}")
+            ns[key] = float(value)
+        ns.update(variables)
+        return ns
+
+    def _compile_vector_expr(self, exprs, var_names, params):
+        """Compile 3 expression strings into f(**vars) -> (N, 3) array."""
+        import numpy as np
+        if not isinstance(exprs, (list, tuple)) or len(exprs) != 3:
+            raise ValueError("Expected a list of 3 expressions for the x, y and z components")
+        self._expr_namespace(dict.fromkeys(var_names), params)  # validates parameter names
+        codes = []
+        for expr in exprs:
+            try:
+                codes.append(compile(str(expr), "<expr>", "eval"))
+            except SyntaxError as e:
+                raise ValueError(f"Invalid expression '{expr}': {e.msg}")
+            names = set(codes[-1].co_names)
+            allowed = set(self._EXPR_FUNCS) | {"pi", "e"} | set(var_names) | set(params or {})
+            unknown = names - allowed
+            if unknown:
+                raise ValueError(f"Unknown names in '{expr}': {sorted(unknown)}. "
+                                 f"Variables: {list(var_names)}, functions: {list(self._EXPR_FUNCS)}")
+
+        def evaluate(**variables):
+            n = len(next(iter(variables.values())))
+            ns = self._expr_namespace(variables, params)
+            out = np.empty((n, 3))
+            with np.errstate(all="ignore"):
+                for i, code in enumerate(codes):
+                    out[:, i] = np.broadcast_to(eval(code, {"__builtins__": {}}, ns), (n,))
+            return out
+        return evaluate
+
+    def _colormap(self, t):
+        t = min(max(float(t), 0.0), 1.0)
+        for (t0, c0), (t1, c1) in zip(self._VIRIDIS, self._VIRIDIS[1:]):
+            if t <= t1:
+                f = (t - t0) / (t1 - t0)
+                return tuple(a + (b - a) * f for a, b in zip(c0, c1))
+        return self._VIRIDIS[-1][1]
+
+    def _replace_object(self, name):
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return
+        data = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if data is not None and data.users == 0:
+            if isinstance(data, bpy.types.Mesh):
+                bpy.data.meshes.remove(data)
+            elif isinstance(data, bpy.types.Curve):
+                bpy.data.curves.remove(data)
+
+    def _solid_material(self, name, color, emission=0.0):
+        mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+        if bpy.app.version < (5, 0, 0):
+            mat.use_nodes = True
+        bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if bsdf is None:
+            bsdf = mat.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
+        rgba = (*color[:3], 1.0)
+        bsdf.inputs["Base Color"].default_value = rgba
+        bsdf.inputs["Roughness"].default_value = 0.4
+        emission_color = bsdf.inputs.get("Emission Color") or bsdf.inputs.get("Emission")
+        if emission_color is not None:
+            emission_color.default_value = rgba
+        if "Emission Strength" in bsdf.inputs:
+            bsdf.inputs["Emission Strength"].default_value = emission
+        mat.diffuse_color = rgba
+        return mat
+
+    def _attribute_colormap_material(self, name, attribute):
+        """Material coloring by a 0..1 float attribute through a viridis color ramp."""
+        mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+        if bpy.app.version < (5, 0, 0):
+            mat.use_nodes = True
+        nodes, links = mat.node_tree.nodes, mat.node_tree.links
+        nodes.clear()
+        out = nodes.new("ShaderNodeOutputMaterial")
+        bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+        attr = nodes.new("ShaderNodeAttribute")
+        attr.attribute_name = attribute
+        ramp = nodes.new("ShaderNodeValToRGB")
+        elements = ramp.color_ramp.elements
+        elements[0].position, elements[0].color = 0.0, (*self._VIRIDIS[0][1], 1.0)
+        elements[1].position, elements[1].color = 1.0, (*self._VIRIDIS[-1][1], 1.0)
+        for pos, color in self._VIRIDIS[1:-1]:
+            elements.new(pos).color = (*color, 1.0)
+        links.new(attr.outputs["Fac"], ramp.inputs["Fac"])
+        links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
+        links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+        bsdf.inputs["Roughness"].default_value = 0.4
+        return mat
+
+    def _arrow_template(self, sides=8, shaft_radius=0.04, head_radius=0.1, head_length=0.3):
+        """Unit arrow along +Z from 0 to 1. Returns (verts, faces) as numpy arrays."""
+        import numpy as np
+        angles = np.linspace(0, 2 * np.pi, sides, endpoint=False)
+        ring = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+        z_neck = 1.0 - head_length
+        verts = np.concatenate([
+            np.column_stack([ring * shaft_radius, np.zeros(sides)]),        # shaft bottom
+            np.column_stack([ring * shaft_radius, np.full(sides, z_neck)]),  # shaft top
+            np.column_stack([ring * head_radius, np.full(sides, z_neck)]),   # head base
+            [[0.0, 0.0, 1.0], [0.0, 0.0, 0.0]],                            # tip, bottom center
+        ])
+        tip, bottom = 3 * sides, 3 * sides + 1
+        faces = []
+        for i in range(sides):
+            j = (i + 1) % sides
+            faces.append([i, j, sides + j, sides + i])                       # shaft side
+            faces.append([sides + i, sides + j, 2 * sides + j, 2 * sides + i])  # neck ring
+            faces.append([2 * sides + i, 2 * sides + j, tip])                # head cone
+            faces.append([j, i, bottom])                                     # bottom cap
+        return verts, faces
+
+    def _rotations_to(self, directions):
+        """Rotation matrices (N, 3, 3) turning +Z onto each unit direction."""
+        import numpy as np
+        d = directions
+        n = len(d)
+        c = d[:, 2]
+        v = np.stack([-d[:, 1], d[:, 0], np.zeros(n)], axis=1)  # z x d
+        k = np.zeros((n, 3, 3))
+        k[:, 0, 1], k[:, 0, 2] = -v[:, 2], v[:, 1]
+        k[:, 1, 0], k[:, 1, 2] = v[:, 2], -v[:, 0]
+        k[:, 2, 0], k[:, 2, 1] = -v[:, 1], v[:, 0]
+        with np.errstate(all="ignore"):
+            factor = np.where(c > -1 + 1e-9, 1.0 / (1.0 + c), 0.0)
+        rot = np.eye(3)[None] + k + np.einsum("nij,njk->nik", k, k) * factor[:, None, None]
+        rot[c <= -1 + 1e-9] = np.diag([1.0, -1.0, -1.0])
+        return rot
+
+    def _build_arrows(self, name, points, vectors, magnitudes, arrow_length, normalize, thickness,
+                      color_scale="linear"):
+        import numpy as np
+        m_max = float(magnitudes.max())
+        dirs = vectors / magnitudes[:, None]
+        lengths = np.full(len(points), arrow_length) if normalize else arrow_length * magnitudes / m_max
+        widths = np.minimum(1.0, lengths / arrow_length) * thickness / 0.04
+
+        tmpl_v, tmpl_f = self._arrow_template()
+        rot = self._rotations_to(dirs)
+        scaled = tmpl_v[None] * np.stack([widths, widths, lengths], axis=1)[:, None, :]
+        # Arrows are centered on their sample point
+        scaled[:, :, 2] -= lengths[:, None] / 2
+        verts = np.einsum("nij,nvj->nvi", rot, scaled) + points[:, None, :]
+        nv = len(tmpl_v)
+        faces = [[i * nv + idx for idx in face] for i in range(len(points)) for face in tmpl_f]
+
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata(verts.reshape(-1, 3).tolist(), [], faces)
+        mesh.update()
+        values = np.log10(magnitudes) if color_scale == "log" else magnitudes
+        span = float(values.max() - values.min()) or 1.0
+        norm = np.repeat((values - values.min()) / span, nv).astype(np.float32)
+        attr = mesh.attributes.new("magnitude", 'FLOAT', 'POINT')
+        attr.data.foreach_set("value", norm)
+        mesh.materials.append(self._attribute_colormap_material(f"{name}_colormap", "magnitude"))
+        obj = bpy.data.objects.new(name, mesh)
+        bpy.context.scene.collection.objects.link(obj)
+        return obj
+
+    def _build_polyline_curve(self, name, polylines, thickness, materials=None, material_indices=None):
+        import numpy as np
+        curve = bpy.data.curves.new(name, 'CURVE')
+        curve.dimensions = '3D'
+        curve.bevel_depth = thickness
+        curve.bevel_resolution = 2
+        curve.use_fill_caps = True
+        # Materials must exist before material_index is set, otherwise it is clamped to 0
+        for mat in materials or []:
+            curve.materials.append(mat)
+        for i, line in enumerate(polylines):
+            spline = curve.splines.new('POLY')
+            spline.points.add(len(line) - 1)
+            co = np.column_stack([line, np.ones(len(line))]).astype(np.float32)
+            spline.points.foreach_set("co", co.ravel())
+            if material_indices is not None:
+                spline.material_index = material_indices[i]
+        obj = bpy.data.objects.new(name, curve)
+        bpy.context.scene.collection.objects.link(obj)
+        return obj
+
+    def _integrate_streamlines(self, field, seeds, bounds, step_size, max_steps):
+        """RK4 along the normalized field (arc length), both directions from each seed."""
+        import numpy as np
+        lo, hi = bounds[:, 0], bounds[:, 1]
+        margin = 1e-6 + 0.01 * (hi - lo)
+
+        def direction(p):
+            f = field(x=p[:, 0], y=p[:, 1], z=p[:, 2])
+            norm = np.linalg.norm(f, axis=1)
+            with np.errstate(all="ignore"):
+                d = f / norm[:, None]
+            bad = ~np.isfinite(d).all(axis=1) | (norm < 1e-12)
+            d[bad] = 0.0
+            return d, bad
+
+        halves = []
+        for sign in (1.0, -1.0):
+            p = seeds.copy()
+            alive = np.ones(len(p), dtype=bool)
+            paths = [[q.copy()] for q in p]
+            h = sign * step_size
+            for _ in range(max_steps):
+                if not alive.any():
+                    break
+                idx = np.nonzero(alive)[0]
+                q = p[idx]
+                k1, b1 = direction(q)
+                k2, b2 = direction(q + h / 2 * k1)
+                k3, b3 = direction(q + h / 2 * k2)
+                k4, b4 = direction(q + h * k3)
+                nxt = q + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+                inside = ((nxt >= lo - margin) & (nxt <= hi + margin)).all(axis=1)
+                ok = inside & ~(b1 | b2 | b3 | b4) & np.isfinite(nxt).all(axis=1)
+                for j, i in enumerate(idx):
+                    if ok[j]:
+                        paths[i].append(nxt[j])
+                p[idx[ok]] = nxt[ok]
+                alive[idx[~ok]] = False
+            halves.append(paths)
+
+        lines = []
+        for fwd, bwd in zip(*halves):
+            line = np.array(bwd[::-1] + fwd[1:])
+            if len(line) >= 2:
+                lines.append(line)
+        return lines
+
+    def plot_vector_field(self, name, field, bounds, resolution=(10, 10, 1), params=None,
+                          mode="arrows", normalize=True, arrow_scale=0.8, thickness=0.02,
+                          color_scale="auto",
+                          seeds=None, seed_resolution=None, step_size=None, max_steps=500,
+                          streamline_color=(0.9, 0.9, 0.9)):
+        """Visualize a vector field F(x, y, z) as colored arrows and/or streamlines."""
+        import numpy as np
+        if mode not in ("arrows", "streamlines", "both"):
+            raise ValueError("mode must be 'arrows', 'streamlines' or 'both'")
+        bounds = np.array(bounds, dtype=float)
+        if bounds.shape != (3, 2) or (bounds[:, 1] < bounds[:, 0]).any():
+            raise ValueError("bounds must be [[xmin, xmax], [ymin, ymax], [zmin, zmax]] with min <= max")
+        res = [max(1, int(r)) for r in resolution]
+        if len(res) != 3 or np.prod(res) > 20000:
+            raise ValueError("resolution must have 3 entries with at most 20000 samples in total")
+        f = self._compile_vector_expr(field, ("x", "y", "z"), params)
+
+        axes = [np.linspace(lo, hi, n) if n > 1 else np.array([(lo + hi) / 2])
+                for (lo, hi), n in zip(bounds, res)]
+        grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+        spacing = min((hi - lo) / (n - 1) for (lo, hi), n in zip(bounds, res) if n > 1) \
+            if any(n > 1 for n in res) else 1.0
+
+        result = {"name": name, "objects": []}
+        if mode in ("arrows", "both"):
+            vectors = f(x=grid[:, 0], y=grid[:, 1], z=grid[:, 2])
+            mags = np.linalg.norm(vectors, axis=1)
+            valid = np.isfinite(vectors).all(axis=1) & (mags > 1e-12)
+            if not valid.any():
+                raise ValueError("The field is zero or undefined at all sample points")
+            if color_scale not in ("auto", "linear", "log"):
+                raise ValueError("color_scale must be 'auto', 'linear' or 'log'")
+            m = mags[valid]
+            if color_scale == "auto":
+                color_scale = "log" if m.max() / m.min() > 100 else "linear"
+            self._replace_object(name)
+            obj = self._build_arrows(name, grid[valid], vectors[valid], m,
+                                     arrow_scale * spacing, normalize, thickness, color_scale)
+            result["objects"].append(obj.name)
+            result["arrows"] = int(valid.sum())
+            result["skipped_samples"] = int((~valid).sum())
+            result["magnitude_range"] = [round(float(mags[valid].min()), 6), round(float(mags[valid].max()), 6)]
+            result["color"] = f"viridis by {color_scale} magnitude (dark = weak, yellow = strong)"
+
+        if mode in ("streamlines", "both"):
+            if seeds is not None:
+                seed_pts = np.array(seeds, dtype=float).reshape(-1, 3)
+            else:
+                seed_res = seed_resolution or [max(2, n // 2) if n > 1 else 1 for n in res]
+                seed_axes = [np.linspace(lo, hi, n + 2)[1:-1] if n > 1 else np.array([(lo + hi) / 2])
+                             for (lo, hi), n in zip(bounds, seed_res)]
+                seed_pts = np.stack(np.meshgrid(*seed_axes, indexing="ij"), axis=-1).reshape(-1, 3)
+            if len(seed_pts) > 2000:
+                raise ValueError("At most 2000 streamline seeds are supported")
+            h = step_size or spacing * 0.1
+            # Keep flat fields flat: integrate within the degenerate axis range
+            lines = self._integrate_streamlines(f, seed_pts, bounds, h, int(max_steps))
+            if not lines:
+                raise ValueError("No streamline could be traced from the seeds")
+            stream_name = f"{name}_streamlines"
+            self._replace_object(stream_name)
+            mat = self._solid_material(f"{stream_name}_mat", streamline_color)
+            obj = self._build_polyline_curve(stream_name, lines, thickness * 0.75, [mat])
+            result["objects"].append(obj.name)
+            result["streamlines"] = len(lines)
+            result["streamline_points"] = int(sum(len(l) for l in lines))
+        return result
+
+    def _integrate_ode(self, rhs, initial, t0, t1, steps):
+        """Fixed-step RK4 for all initial conditions at once. Returns (steps+1, K, 3) and times."""
+        import numpy as np
+        dt = (t1 - t0) / steps
+        y = np.array(initial, dtype=float).reshape(-1, 3)
+        out = np.full((steps + 1, len(y), 3), np.nan)
+        out[0] = y
+
+        def f(t, y):
+            return rhs(x=y[:, 0], y=y[:, 1], z=y[:, 2], t=np.full(len(y), t))
+
+        t = t0
+        for i in range(steps):
+            k1 = f(t, y)
+            k2 = f(t + dt / 2, y + dt / 2 * k1)
+            k3 = f(t + dt / 2, y + dt / 2 * k2)
+            k4 = f(t + dt, y + dt * k3)
+            y = y + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+            t += dt
+            out[i + 1] = y
+        return out, np.linspace(t0, t1, steps + 1)
+
+    def plot_trajectory(self, name, points=None, ode=None, initial=None, t_span=(0.0, 10.0),
+                        steps=2000, params=None, thickness=0.03, color=None, fit_size=None,
+                        animate=False, frame_start=None, frame_end=None, marker_size=None):
+        """Draw trajectories from given points or by integrating an ODE dx/dt = F(x, y, z, t)."""
+        import numpy as np
+        if (points is None) == (ode is None):
+            raise ValueError("Give either 'points' or 'ode' (with 'initial')")
+        if points is not None:
+            arr = np.array(points, dtype=float)
+            lines = [arr] if arr.ndim == 2 else list(arr)
+            source = "points"
+        else:
+            if initial is None:
+                raise ValueError("'initial' is required with 'ode'")
+            steps = int(steps)
+            if not 1 <= steps <= 200000:
+                raise ValueError("steps must be between 1 and 200000")
+            rhs = self._compile_vector_expr(ode, ("x", "y", "z", "t"), params)
+            sol, _ = self._integrate_ode(rhs, initial, float(t_span[0]), float(t_span[1]), steps)
+            lines = [sol[:, k] for k in range(sol.shape[1])]
+            source = "ode"
+
+        cleaned, truncated = [], 0
+        for line in lines:
+            line = np.asarray(line, dtype=float).reshape(-1, 3)
+            finite = np.isfinite(line).all(axis=1)
+            if not finite.all():
+                truncated += 1
+                line = line[:np.argmin(finite)]  # cut at the first non-finite point
+            if len(line) >= 2:
+                cleaned.append(line)
+        if not cleaned:
+            raise ValueError("No trajectory with at least 2 finite points")
+
+        all_pts = np.concatenate(cleaned)
+        transform = {"scale": 1.0, "offset": [0.0, 0.0, 0.0]}
+        if fit_size:
+            center = (all_pts.max(axis=0) + all_pts.min(axis=0)) / 2
+            extent = float((all_pts.max(axis=0) - all_pts.min(axis=0)).max()) or 1.0
+            scale = float(fit_size) / extent
+            cleaned = [(line - center) * scale for line in cleaned]
+            transform = {"scale": round(scale, 6), "offset": self._round_vec(-center * scale)}
+
+        n = len(cleaned)
+        colors = [color] * n if color else [self._colormap(i / max(n - 1, 1)) for i in range(n)]
+        mats = [self._solid_material(f"{name}_mat_{i}", c, emission=0.3) for i, c in enumerate(colors)]
+        self._replace_object(name)
+        obj = self._build_polyline_curve(name, cleaned, thickness, mats, list(range(n)))
+
+        result = {"name": name, "source": source, "trajectories": n,
+                  "points_per_trajectory": [len(l) for l in cleaned],
+                  "bounds": [self._round_vec(all_pts.min(axis=0)), self._round_vec(all_pts.max(axis=0))],
+                  "transform": transform}
+        if truncated:
+            result["truncated_nonfinite"] = truncated
+
+        if animate:
+            scene = bpy.context.scene
+            fs = scene.frame_start if frame_start is None else int(frame_start)
+            fe = scene.frame_end if frame_end is None else int(frame_end)
+            if fe <= fs:
+                raise ValueError("frame_end must be greater than frame_start")
+            curve = obj.data
+            # SPLINE mapping follows point index, i.e. integration time for ODE trajectories
+            curve.bevel_factor_mapping_end = 'SPLINE'
+            curve.bevel_factor_end = 0.0
+            curve.keyframe_insert("bevel_factor_end", frame=fs)
+            curve.bevel_factor_end = 1.0
+            curve.keyframe_insert("bevel_factor_end", frame=fe)
+            for fc in self._get_fcurves(curve):
+                for kp in fc.keyframe_points:
+                    kp.interpolation = 'LINEAR'
+
+            markers = []
+            radius = marker_size or thickness * 3
+            frames = np.arange(fs, fe + 1)
+            for i, line in enumerate(cleaned):
+                marker_name = f"{name}_marker_{i}"
+                self._replace_object(marker_name)
+                mesh = bpy.data.meshes.new(marker_name)
+                import bmesh
+                bm = bmesh.new()
+                bmesh.ops.create_uvsphere(bm, u_segments=16, v_segments=8, radius=radius)
+                bm.to_mesh(mesh)
+                bm.free()
+                mesh.materials.append(self._solid_material(f"{name}_marker_mat_{i}", colors[i], emission=2.0))
+                marker = bpy.data.objects.new(marker_name, mesh)
+                scene.collection.objects.link(marker)
+                marker.parent = obj
+                idx = np.round((frames - fs) / (fe - fs) * (len(line) - 1)).astype(int)
+                for frame, j in zip(frames, idx):
+                    marker.location = line[j]
+                    marker.keyframe_insert("location", frame=int(frame))
+                for fc in self._get_fcurves(marker):
+                    for kp in fc.keyframe_points:
+                        kp.interpolation = 'LINEAR'
+                markers.append(marker_name)
+            scene.frame_set(scene.frame_current)
+            result["animation"] = {"frame_start": fs, "frame_end": fe, "markers": markers}
+        return result
 
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""

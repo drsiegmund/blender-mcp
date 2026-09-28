@@ -1,7 +1,6 @@
 import os
 
 import bpy
-import pytest
 
 
 def _run_preview(server):

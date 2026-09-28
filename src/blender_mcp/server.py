@@ -820,6 +820,109 @@ def remove_nla(ctx: Context, object_name: str, track_name: str, strip_name: str 
                         "strip_name": strip_name, "target": target}, "removing NLA strip/track")
 
 
+@telemetry_tool("plot_vector_field")
+@mcp.tool()
+def plot_vector_field(ctx: Context, name: str, field: List[str], bounds: List[List[float]],
+                      resolution: List[int] = [10, 10, 1], params: Dict[str, float] = None,
+                      mode: str = "arrows", normalize: bool = True, arrow_scale: float = 0.8,
+                      thickness: float = 0.02, color_scale: str = "auto",
+                      seeds: List[List[float]] = None, seed_resolution: List[int] = None,
+                      step_size: float = None, max_steps: int = 500,
+                      streamline_color: List[float] = [0.9, 0.9, 0.9]) -> str:
+    """
+    Visualize a vector field F(x, y, z) as colored arrows and/or streamlines (field lines).
+    Re-running with the same name replaces the previous objects, for quick iteration.
+
+    Parameters:
+    - name: Object name. Arrows are created as <name>, streamlines as <name>_streamlines.
+    - field: Three numpy expressions for Fx, Fy, Fz in x, y, z, e.g. ["-y", "x", "0"].
+      Functions: sin, cos, tan, arcsin, arccos, arctan, arctan2, sinh, cosh, tanh, exp,
+      log, log10, sqrt, abs, sign, minimum, maximum, where, hypot, floor, ceil; constants pi, e.
+      Magnetic dipole along z: ["3*x*z/(x**2+y**2+z**2)**2.5", "3*y*z/(x**2+y**2+z**2)**2.5",
+      "(3*z**2-(x**2+y**2+z**2))/(x**2+y**2+z**2)**2.5"]
+    - bounds: [[xmin, xmax], [ymin, ymax], [zmin, zmax]]; use equal min/max for a planar slice
+    - resolution: Samples per axis [nx, ny, nz] (at most 20000 in total)
+    - params: Named constants usable in the expressions, e.g. {"k": 2.0}
+    - mode: "arrows", "streamlines" or "both"
+    - normalize: Equal arrow length (magnitude shown by color only). Recommended for fields
+      with singularities. If false, length is proportional to magnitude.
+    - arrow_scale: Arrow length relative to the grid spacing
+    - thickness: Arrow shaft / streamline radius
+    - color_scale: "linear", "log" or "auto" (log if magnitudes span more than 100x)
+    - seeds: Start points for streamlines. Default: a grid of half the arrow resolution.
+    - seed_resolution: Seed grid [nx, ny, nz] if no seeds are given
+    - step_size: Integration step along the field line (default: 0.1 x grid spacing)
+    - max_steps: Maximum steps per direction for each streamline
+    - streamline_color: RGB color of the streamlines
+
+    Samples where the field is undefined (e.g. singularities) are skipped. Returns object
+    names, arrow count, magnitude range and streamline statistics.
+    """
+    try:
+        blender = get_blender_connection()
+        params_dict = {"name": name, "field": field, "bounds": bounds, "resolution": resolution,
+                       "mode": mode, "normalize": normalize, "arrow_scale": arrow_scale,
+                       "thickness": thickness, "color_scale": color_scale, "max_steps": max_steps,
+                       "streamline_color": streamline_color}
+        for key, value in {"params": params, "seeds": seeds, "seed_resolution": seed_resolution,
+                           "step_size": step_size}.items():
+            if value is not None:
+                params_dict[key] = value
+        result = blender.send_command("plot_vector_field", params_dict)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error plotting vector field: {str(e)}")
+        return f"Error plotting vector field: {str(e)}"
+
+
+@telemetry_tool("plot_trajectory")
+@mcp.tool()
+def plot_trajectory(ctx: Context, name: str, points: List[Any] = None, ode: List[str] = None,
+                    initial: List[Any] = None, t_span: List[float] = [0.0, 10.0], steps: int = 2000,
+                    params: Dict[str, float] = None, thickness: float = 0.03,
+                    color: List[float] = None, fit_size: float = None, animate: bool = False,
+                    frame_start: int = None, frame_end: int = None, marker_size: float = None) -> str:
+    """
+    Draw one or more trajectories as tube curves, either from given points or by solving
+    the ODE dx/dt = F(x, y, z, t) with fixed-step RK4. Re-running with the same name
+    replaces the previous curve.
+
+    Parameters:
+    - name: Object name of the curve
+    - points: A list of [x, y, z] points, or a list of such lists for several trajectories
+    - ode: Three numpy expressions for dx/dt, dy/dt, dz/dt in x, y, z, t (same functions as
+      plot_vector_field), e.g. Lorenz: ["sigma*(y-x)", "x*(rho-z)-y", "x*y-beta*z"]
+    - initial: Initial condition [x0, y0, z0], or a list of them to compare trajectories
+    - t_span: [t0, t1] integration interval
+    - steps: Number of RK4 steps (the curve gets steps+1 points)
+    - params: Named constants for the expressions, e.g. {"sigma": 10, "rho": 28, "beta": 2.667}
+    - thickness: Tube radius
+    - color: RGB color for all trajectories (default: viridis colors per trajectory)
+    - fit_size: Scale and center the result so its largest extent equals this size
+    - animate: Animate drawing the curve over time, with a glowing marker at the current
+      state. The drawing progress follows integration time, not arc length.
+    - frame_start / frame_end: Animation range (default: scene range)
+    - marker_size: Radius of the markers (default: 3 x thickness)
+
+    Trajectories are cut at the first non-finite value (blow-up). Returns point counts,
+    data bounds (before fitting) and the applied transform.
+    """
+    try:
+        blender = get_blender_connection()
+        params_dict = {"name": name, "t_span": t_span, "steps": steps, "thickness": thickness,
+                       "animate": animate}
+        for key, value in {"points": points, "ode": ode, "initial": initial, "params": params,
+                           "color": color, "fit_size": fit_size, "frame_start": frame_start,
+                           "frame_end": frame_end, "marker_size": marker_size}.items():
+            if value is not None:
+                params_dict[key] = value
+        result = blender.send_command("plot_trajectory", params_dict)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error plotting trajectory: {str(e)}")
+        return f"Error plotting trajectory: {str(e)}"
+
+
 @telemetry_tool("review_render")
 @mcp.tool()
 def review_render(ctx: Context, source: str = "render", max_size: int = 1280) -> list:

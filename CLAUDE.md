@@ -77,6 +77,13 @@ All NLA tools take `target="data"` to work on the data block's animation (light,
 
 Fcurve access is slot-aware and works with layered actions (Blender 4.4+/5.x) and legacy actions. Snapshots include keyframes of the object's data block under `data.` paths.
 
+### Scientific Visualization
+
+- **`plot_vector_field`** — Visualizes F(x, y, z), given as three numpy expressions, as arrows (one mesh, colored by magnitude via a viridis ramp on a `magnitude` attribute; linear or log scale, auto-selected for large ranges) and/or streamlines (RK4 along the normalized field, traced both ways from seeds). Undefined samples (singularities) are skipped. Planar slices via equal min/max bounds.
+- **`plot_trajectory`** — Draws trajectories from points or solves dx/dt = F(x, y, z, t) with fixed-step RK4 for one or several initial conditions (each with its own color). Optional `fit_size` scaling and an animation that draws the curve in integration time with a glowing marker.
+
+Expressions are compiled with a whitelist of numpy functions (`sin`, `exp`, `sqrt`, `arctan2`, ...), the variables and user `params`; any other name is rejected before evaluation. Re-plotting with the same name replaces the objects, which fits the render feedback loop.
+
 ### Batch Script Execution
 
 - **`execute_batch_script`** — Runs a long-running Python script in Blender asynchronously (via `bpy.app.timers`) and returns a batch ID immediately. Use instead of `execute_blender_code` for scripts that would exceed the socket timeout (e.g. baking, simulations, heavy geometry generation). Only one batch runs at a time.
@@ -99,4 +106,5 @@ Fcurve access is slot-aware and works with layered actions (Blender 4.4+/5.x) an
 
 ## Roadmap
 
-- **Scientific visualization** — Support for visualizing magnetic fields, force fields, dynamic physical systems (particle systems, fluid simulations, rigid body dynamics)
+- **Scientific visualization** — Done: vector fields and ODE trajectories. Next ideas: parametric surfaces and function graphs, LaTeX labels in 3D, color legends, physics simulations (particles, fluids, rigid bodies)
+- **Feedback loop** — Scene checkpoints (save/restore) and `compare_renders` (before/after with difference image)

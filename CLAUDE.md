@@ -20,9 +20,22 @@ Extend the MCP server with a collaborative workflow featuring:
 
 - Commit messages in English
 
-## Testing Without a Blender GUI
+## Testing
 
-Blender is available as a Python module (`pip install bpy`, Python 3.11 for Blender 5.0). The add-on handlers can be tested headlessly by loading `addon.py` via `importlib` and calling `BlenderMCPServer` methods directly. `bpy.app.timers` do not fire in module mode, so the socket loop itself (and async render/batch) needs a real Blender.
+Tests live in `tests/` and run against Blender as a Python module (Python 3.11 required for bpy 5.0):
+
+```bash
+python3.11 -m venv .venv-test && source .venv-test/bin/activate
+pip install -e . -r tests/requirements.txt
+python -m pytest tests
+```
+
+- Fixtures in `tests/conftest.py` load `addon.py` via `importlib` and give each test a fresh default scene and `BlenderMCPServer`.
+- `bpy.app.timers` do not fire in module mode: async preview renders are driven by calling `_preview_step()` directly. The socket loop, async `render_scene` and batch scripts still need a real Blender to test.
+- Renders in tests use Cycles on the CPU (EEVEE needs a GPU/EGL).
+- `tests/test_server_e2e.py` runs the MCP tool functions from `server.py` against `tests/fake_blender.py`, a subprocess that serves the add-on dispatcher over TCP.
+- GitHub Actions (`.github/workflows/tests.yml`) runs the suite on every push and pull request.
+- Keep `mcp` pinned below 2.x: `FastMCP` was renamed in mcp 2 and the server fails to import.
 
 ## Custom MCP Tools
 

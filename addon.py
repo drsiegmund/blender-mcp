@@ -481,7 +481,8 @@ class BlenderMCPServer:
     def _get_material_props(self, mat):
         """Extract Principled BSDF properties from a material."""
         props = {"base_color": None, "roughness": None, "metallic": None, "transmission": None}
-        if not mat.use_nodes or not mat.node_tree:
+        # Blender 5.0+ always uses nodes and deprecates use_nodes
+        if not mat.node_tree or (bpy.app.version < (5, 0, 0) and not mat.use_nodes):
             return props
         for node in mat.node_tree.nodes:
             if node.type == 'BSDF_PRINCIPLED':

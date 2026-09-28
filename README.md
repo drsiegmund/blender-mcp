@@ -31,8 +31,10 @@ clear_change_log → work in Blender → get_change_log → see all changes
 Insert and delete keyframes on any animatable property (including light energy and camera focal length via `data.` paths), inspect fcurves, NLA tracks and drivers, set the frame range and fps, and scrub to any frame to see where everything is.
 
 ```
-insert_keyframes → set_timeline → scrub_timeline → get_animation_data
+insert_keyframes → set_timeline → scrub_timeline → render_animation_preview
 ```
+
+`render_animation_preview` renders evenly spaced frames into one labeled contact sheet, so Claude can judge the motion in a single image. NLA tools (`push_action_to_nla`, `add_nla_strip`, `update_nla_strip`, `set_nla_track`, `remove_nla`) layer and sequence actions.
 
 ### Constraints & Modifiers
 Snapshots and diffs now capture object constraints (Track To, Follow Path, Copy Location, etc.) and modifiers (Subdivision, Array, Mirror, Solidify, etc.) with type-specific parameters. Essential for animation workflows where camera paths are driven by constraints.
@@ -62,6 +64,12 @@ Snapshots and diffs now capture object constraints (Track To, Follow Path, Copy 
 | `get_animation_data` | Fcurves, keyframe values, actions, NLA tracks, drivers |
 | `set_timeline` | Set frame range, fps and current frame |
 | `scrub_timeline` | Jump to a frame and get the evaluated object states |
+| `render_animation_preview` | Render sampled frames into a labeled contact sheet (async) |
+| `push_action_to_nla` | Push the active action down into an NLA track |
+| `add_nla_strip` | Place an action as NLA strip (repeat, scale, blend) |
+| `update_nla_strip` | Move or change an NLA strip |
+| `set_nla_track` | Mute, solo or rename an NLA track |
+| `remove_nla` | Remove an NLA strip or track |
 | `get_scene_info` | Quick scene overview (object count, materials) |
 | `get_object_info` | Detailed info for a single object (incl. constraints, modifiers) |
 | `get_viewport_screenshot` | Capture the 3D viewport |
@@ -100,7 +108,6 @@ In Claude Code, ask Claude to run `get_scene_info` — if it returns your scene 
 
 ## Roadmap
 
-- **Animation workflow** — Animation preview rendering, NLA strip management
 - **Scientific visualization** — Magnetic fields, force fields, particle systems, fluid simulations, rigid body dynamics
 - **Cowork integration** — Multi-user collaborative sessions with shared scene state
 

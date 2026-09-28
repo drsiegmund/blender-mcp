@@ -54,6 +54,7 @@ class BlenderMCPServer:
         self._batch_status = None
         self._batch_result = None
         self._batch_id = None
+        self._preview_job = None
 
     def _make_depsgraph_handler(self):
         """Create a closure that captures self for use as a bpy.app.handlers callback."""
@@ -249,6 +250,7 @@ class BlenderMCPServer:
             "clear_change_log": self.clear_change_log,
             "render_scene": self.render_scene,
             "poll_render_status": self.poll_render_status,
+            "render_animation_preview": self.render_animation_preview,
             "execute_batch_script": self.execute_batch_script,
             "poll_batch_status": self.poll_batch_status,
             "insert_keyframes": self.insert_keyframes,
@@ -256,6 +258,11 @@ class BlenderMCPServer:
             "get_animation_data": self.get_animation_data,
             "set_timeline": self.set_timeline,
             "scrub_timeline": self.scrub_timeline,
+            "push_action_to_nla": self.push_action_to_nla,
+            "add_nla_strip": self.add_nla_strip,
+            "update_nla_strip": self.update_nla_strip,
+            "remove_nla": self.remove_nla,
+            "set_nla_track": self.set_nla_track,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
             "get_telemetry_consent": self.get_telemetry_consent,
@@ -858,20 +865,10 @@ class BlenderMCPServer:
         except Exception as e:
             return {"error": str(e)}
 
-    def render_scene(self, filepath=None, resolution_x=1280, resolution_y=720,
-                     engine="EEVEE", samples=None):
-        """Start an async render and return immediately."""
-        import uuid as _uuid
-        if not filepath:
-            return {"error": "No filepath provided"}
-
-        if self._render_status == "rendering":
-            return {"error": "A render is already in progress", "render_id": self._render_id}
-
+    def _apply_render_settings(self, engine, resolution_x, resolution_y, samples):
+        """Apply render settings and return (saved_settings, engine_id, samples_used)."""
         scene = bpy.context.scene
         render = scene.render
-
-        # Save current settings
         saved = {
             "engine": render.engine,
             "resolution_x": render.resolution_x,
@@ -883,13 +880,11 @@ class BlenderMCPServer:
             "cycles_samples": scene.cycles.samples if hasattr(scene, 'cycles') else None,
         }
 
-        # Set render settings
         engine_id = self._get_engine_id(engine)
         render.engine = engine_id
         render.resolution_x = resolution_x
         render.resolution_y = resolution_y
         render.resolution_percentage = 100
-        render.filepath = filepath
         render.image_settings.file_format = 'PNG'
 
         if engine.upper() == "EEVEE":
@@ -899,6 +894,34 @@ class BlenderMCPServer:
         else:
             s = min(samples or 64, 256)
             scene.cycles.samples = s
+        return saved, engine_id, s
+
+    def _restore_render_settings(self, saved):
+        scene = bpy.context.scene
+        render = scene.render
+        render.engine = saved["engine"]
+        render.resolution_x = saved["resolution_x"]
+        render.resolution_y = saved["resolution_y"]
+        render.resolution_percentage = saved["resolution_percentage"]
+        render.filepath = saved["filepath"]
+        render.image_settings.file_format = saved["file_format"]
+        if saved["eevee_samples"] is not None and hasattr(scene.eevee, 'taa_render_samples'):
+            scene.eevee.taa_render_samples = saved["eevee_samples"]
+        if saved["cycles_samples"] is not None and hasattr(scene, 'cycles'):
+            scene.cycles.samples = saved["cycles_samples"]
+
+    def render_scene(self, filepath=None, resolution_x=1280, resolution_y=720,
+                     engine="EEVEE", samples=None):
+        """Start an async render and return immediately."""
+        import uuid as _uuid
+        if not filepath:
+            return {"error": "No filepath provided"}
+
+        if self._render_status == "rendering":
+            return {"error": "A render is already in progress", "render_id": self._render_id}
+
+        saved, engine_id, s = self._apply_render_settings(engine, resolution_x, resolution_y, samples)
+        bpy.context.scene.render.filepath = filepath
 
         # Set async render state
         self._render_id = str(_uuid.uuid4())
@@ -923,21 +946,184 @@ class BlenderMCPServer:
                 server_ref._render_result = {"error": str(e)}
                 print(f"Render failed: {str(e)}")
             finally:
-                render.engine = saved["engine"]
-                render.resolution_x = saved["resolution_x"]
-                render.resolution_y = saved["resolution_y"]
-                render.resolution_percentage = saved["resolution_percentage"]
-                render.filepath = saved["filepath"]
-                render.image_settings.file_format = saved["file_format"]
-                if saved["eevee_samples"] is not None and hasattr(scene.eevee, 'taa_render_samples'):
-                    scene.eevee.taa_render_samples = saved["eevee_samples"]
-                if saved["cycles_samples"] is not None and hasattr(scene, 'cycles'):
-                    scene.cycles.samples = saved["cycles_samples"]
+                server_ref._restore_render_settings(saved)
             return None
 
         bpy.app.timers.register(_do_render, first_interval=0.1)
 
         return {"status": "started", "render_id": self._render_id}
+
+    # ---- Animation preview (contact sheet) ----
+
+    # 3x5 bitmap digits for frame labels, rows top to bottom
+    _DIGITS = {
+        "0": ["111", "101", "101", "101", "111"], "1": ["010", "110", "010", "010", "111"],
+        "2": ["111", "001", "111", "100", "111"], "3": ["111", "001", "111", "001", "111"],
+        "4": ["101", "101", "111", "001", "001"], "5": ["111", "100", "111", "001", "111"],
+        "6": ["111", "100", "111", "101", "111"], "7": ["111", "001", "010", "010", "010"],
+        "8": ["111", "101", "111", "101", "111"], "9": ["111", "101", "111", "001", "111"],
+        "-": ["000", "000", "111", "000", "000"],
+    }
+
+    def _preview_frames(self, frame_start, frame_end, num_frames):
+        if num_frames <= 1 or frame_start == frame_end:
+            return [frame_start]
+        step = (frame_end - frame_start) / (num_frames - 1)
+        frames = [int(round(frame_start + i * step)) for i in range(num_frames)]
+        return sorted(set(frames))
+
+    def _draw_label(self, tile, text, scale):
+        """Draw text (digits) into the top-left corner of an RGBA tile (rows bottom-up)."""
+        h = tile.shape[0]
+        glyph_w, glyph_h = 3 * scale, 5 * scale
+        pad = scale
+        box_w = len(text) * (glyph_w + scale) + pad
+        box_h = glyph_h + 2 * pad
+        if box_w > tile.shape[1] or box_h > h:
+            return
+        tile[h - box_h:h, 0:box_w] = (0.0, 0.0, 0.0, 1.0)
+        for i, ch in enumerate(text):
+            pattern = self._DIGITS.get(ch)
+            if not pattern:
+                continue
+            x0 = pad + i * (glyph_w + scale)
+            for row, bits in enumerate(pattern):
+                for col, bit in enumerate(bits):
+                    if bit == "1":
+                        y_top = h - pad - row * scale
+                        tile[y_top - scale:y_top, x0 + col * scale:x0 + (col + 1) * scale] = (1.0, 1.0, 1.0, 1.0)
+
+    def _compose_contact_sheet(self, frame_paths, frames, columns, filepath):
+        """Compose rendered frames into one labeled grid image. Returns (columns, rows)."""
+        import numpy as np
+        n = len(frame_paths)
+        cols = max(1, min(columns or int(np.ceil(np.sqrt(n))), n))
+        rows = int(np.ceil(n / cols))
+        gap = 4
+
+        tiles = []
+        for path in frame_paths:
+            img = bpy.data.images.load(path, check_existing=False)
+            try:
+                w, h = img.size
+                buf = np.empty(w * h * 4, dtype=np.float32)
+                img.pixels.foreach_get(buf)
+                tiles.append(buf.reshape(h, w, 4))
+            finally:
+                bpy.data.images.remove(img)
+
+        h, w = tiles[0].shape[:2]
+        sheet_w = cols * w + (cols + 1) * gap
+        sheet_h = rows * h + (rows + 1) * gap
+        sheet = np.empty((sheet_h, sheet_w, 4), dtype=np.float32)
+        sheet[:] = (0.15, 0.15, 0.15, 1.0)
+        label_scale = max(2, h // 60)
+        for i, (tile, frame) in enumerate(zip(tiles, frames)):
+            tile = tile.copy()
+            tile[..., 3] = 1.0
+            self._draw_label(tile, str(frame), label_scale)
+            r, c = divmod(i, cols)
+            # Image rows are stored bottom-up; row 0 of the grid is at the top
+            y0 = gap + (rows - 1 - r) * (h + gap)
+            x0 = gap + c * (w + gap)
+            sheet[y0:y0 + h, x0:x0 + w] = tile
+
+        out = bpy.data.images.new("MCP_ContactSheet", sheet_w, sheet_h, alpha=True)
+        try:
+            out.pixels.foreach_set(sheet.ravel())
+            out.filepath_raw = filepath
+            out.file_format = 'PNG'
+            out.save()
+        finally:
+            bpy.data.images.remove(out)
+        return cols, rows
+
+    def render_animation_preview(self, filepath=None, frame_start=None, frame_end=None,
+                                 num_frames=9, columns=None, resolution_x=480,
+                                 resolution_y=270, engine="EEVEE", samples=None):
+        """Start rendering sampled frames into a contact sheet; poll with poll_render_status."""
+        import uuid as _uuid
+        if not filepath:
+            return {"error": "No filepath provided"}
+        if self._render_status == "rendering":
+            return {"error": "A render is already in progress", "render_id": self._render_id}
+
+        scene = bpy.context.scene
+        start = scene.frame_start if frame_start is None else int(frame_start)
+        end = scene.frame_end if frame_end is None else int(frame_end)
+        if start > end:
+            return {"error": f"frame_start ({start}) must not be greater than frame_end ({end})"}
+        num_frames = max(1, min(int(num_frames), 25))
+        frames = self._preview_frames(start, end, num_frames)
+
+        saved, engine_id, s = self._apply_render_settings(engine, resolution_x, resolution_y, samples)
+        base, _ = os.path.splitext(filepath)
+        self._preview_job = {
+            "frames": frames,
+            "paths": [f"{base}_f{frame:05d}.png" for frame in frames],
+            "next": 0,
+            "saved": saved,
+            "frame_current": scene.frame_current,
+            "filepath": filepath,
+            "columns": columns,
+            "engine": engine,
+            "samples": s,
+            "tile_size": [resolution_x, resolution_y],
+        }
+        self._render_id = str(_uuid.uuid4())
+        self._render_status = "rendering"
+        self._render_result = {"type": "animation_preview", "frames_done": 0, "frames_total": len(frames)}
+
+        bpy.app.timers.register(self._preview_step, first_interval=0.1)
+        return {"status": "started", "render_id": self._render_id, "frames": frames,
+                "engine": engine_id, "samples": s}
+
+    def _preview_step(self):
+        """Render one preview frame per timer tick so polls are answered in between."""
+        job = self._preview_job
+        if job is None:
+            return None
+        scene = bpy.context.scene
+        try:
+            i = job["next"]
+            if i < len(job["frames"]):
+                scene.frame_set(job["frames"][i])
+                scene.render.filepath = job["paths"][i]
+                bpy.ops.render.render(write_still=True)
+                job["next"] = i + 1
+                self._render_result["frames_done"] = i + 1
+                return 0.01
+
+            cols, rows = self._compose_contact_sheet(job["paths"], job["frames"], job["columns"], job["filepath"])
+            self._render_status = "completed"
+            self._render_result = {
+                "type": "animation_preview",
+                "filepath": job["filepath"],
+                "frames": job["frames"],
+                "columns": cols,
+                "rows": rows,
+                "tile_size": job["tile_size"],
+                "engine": job["engine"],
+                "samples": job["samples"],
+                "layout": "row-major, top-left first; each tile is labeled with its frame number",
+            }
+            self._last_render_path = job["filepath"]
+        except Exception as e:
+            traceback.print_exc()
+            self._render_status = "failed"
+            self._render_result = {"type": "animation_preview", "error": str(e)}
+        self._finish_preview_job()
+        return None
+
+    def _finish_preview_job(self):
+        job = self._preview_job
+        self._preview_job = None
+        scene = bpy.context.scene
+        self._restore_render_settings(job["saved"])
+        scene.frame_set(job["frame_current"])
+        for path in job["paths"]:
+            with suppress(OSError):
+                os.remove(path)
 
     def poll_render_status(self):
         """Poll the status of an async render."""
@@ -1296,6 +1482,142 @@ class BlenderMCPServer:
             states[obj.name] = state
 
         return {"frame": frame, "timeline": self._get_timeline(), "objects": states}
+
+    # ---- NLA ----
+
+    _BLEND_TYPES = {'REPLACE', 'COMBINE', 'ADD', 'SUBTRACT', 'MULTIPLY'}
+    _STRIP_EXTRAPOLATIONS = {'HOLD', 'HOLD_FORWARD', 'NOTHING'}
+
+    def _get_nla_owner(self, obj, target):
+        if target == "object":
+            return obj
+        if target == "data":
+            if obj.data is None:
+                raise ValueError(f"Object '{obj.name}' has no data block")
+            return obj.data
+        raise ValueError(f"Invalid target: {target}. Use 'object' or 'data'")
+
+    def _get_nla_track(self, anim, track_name):
+        track = anim.nla_tracks.get(track_name) if anim else None
+        if not track:
+            raise ValueError(f"NLA track not found: {track_name}")
+        return track
+
+    def _get_nla_strip(self, track, strip_name):
+        strip = track.strips.get(strip_name)
+        if not strip:
+            raise ValueError(f"NLA strip not found in track '{track.name}': {strip_name}")
+        return strip
+
+    def _apply_strip_settings(self, strip, repeat=None, scale=None, blend_type=None,
+                              extrapolation=None, blend_in=None, blend_out=None, mute=None):
+        if blend_type is not None:
+            if blend_type.upper() not in self._BLEND_TYPES:
+                raise ValueError(f"Invalid blend_type: {blend_type}. Use one of {sorted(self._BLEND_TYPES)}")
+            strip.blend_type = blend_type.upper()
+        if extrapolation is not None:
+            if extrapolation.upper() not in self._STRIP_EXTRAPOLATIONS:
+                raise ValueError(f"Invalid extrapolation: {extrapolation}. Use one of {sorted(self._STRIP_EXTRAPOLATIONS)}")
+            strip.extrapolation = extrapolation.upper()
+        if repeat is not None:
+            strip.repeat = float(repeat)
+        if scale is not None:
+            strip.scale = float(scale)
+        if blend_in is not None:
+            strip.blend_in = float(blend_in)
+        if blend_out is not None:
+            strip.blend_out = float(blend_out)
+        if mute is not None:
+            strip.mute = bool(mute)
+
+    def _nla_result(self, obj, owner):
+        bpy.context.scene.frame_set(bpy.context.scene.frame_current)
+        anim = owner.animation_data
+        return {
+            "object": obj.name,
+            "target": "object" if owner is obj else "data",
+            "active_action": anim.action.name if anim and anim.action else None,
+            "nla_tracks": self._serialize_nla(anim),
+        }
+
+    def push_action_to_nla(self, object_name, target="object", track_name=None, strip_name=None):
+        """Move the active action into a new NLA track (like 'Push Down' in the UI)."""
+        obj = self._get_object(object_name)
+        owner = self._get_nla_owner(obj, target)
+        anim = owner.animation_data
+        if not anim or not anim.action:
+            raise ValueError(f"'{object_name}' ({target}) has no active action to push down")
+        action = anim.action
+        slot = getattr(anim, "action_slot", None)
+        track = anim.nla_tracks.new()
+        if track_name:
+            track.name = track_name
+        strip = track.strips.new(strip_name or action.name, int(action.frame_range[0]), action)
+        if slot is not None and hasattr(strip, "action_slot"):
+            strip.action_slot = slot
+        anim.action = None
+        return self._nla_result(obj, owner)
+
+    def add_nla_strip(self, object_name, action_name, frame_start, target="object",
+                      track_name=None, strip_name=None, repeat=None, scale=None,
+                      blend_type=None, extrapolation=None, blend_in=None, blend_out=None):
+        """Add an action as NLA strip, on an existing or new track."""
+        obj = self._get_object(object_name)
+        owner = self._get_nla_owner(obj, target)
+        action = bpy.data.actions.get(action_name)
+        if not action:
+            raise ValueError(f"Action not found: {action_name}")
+        anim = owner.animation_data or owner.animation_data_create()
+        track = anim.nla_tracks.get(track_name) if track_name else None
+        if track is None:
+            track = anim.nla_tracks.new()
+            if track_name:
+                track.name = track_name
+        try:
+            strip = track.strips.new(strip_name or action.name, int(frame_start), action)
+        except RuntimeError as e:
+            raise ValueError(f"Could not add strip at frame {frame_start} on track '{track.name}': {e}")
+        self._apply_strip_settings(strip, repeat, scale, blend_type, extrapolation, blend_in, blend_out)
+        return self._nla_result(obj, owner)
+
+    def update_nla_strip(self, object_name, track_name, strip_name, target="object",
+                         frame_start=None, repeat=None, scale=None, blend_type=None,
+                         extrapolation=None, blend_in=None, blend_out=None, mute=None):
+        """Move or change an NLA strip."""
+        obj = self._get_object(object_name)
+        owner = self._get_nla_owner(obj, target)
+        track = self._get_nla_track(owner.animation_data, track_name)
+        strip = self._get_nla_strip(track, strip_name)
+        self._apply_strip_settings(strip, repeat, scale, blend_type, extrapolation, blend_in, blend_out, mute)
+        if frame_start is not None:
+            # frame_start_ui moves the strip and keeps its length
+            strip.frame_start_ui = float(frame_start)
+        return self._nla_result(obj, owner)
+
+    def remove_nla(self, object_name, track_name, strip_name=None, target="object"):
+        """Remove an NLA strip, or the whole track if no strip is given."""
+        obj = self._get_object(object_name)
+        owner = self._get_nla_owner(obj, target)
+        anim = owner.animation_data
+        track = self._get_nla_track(anim, track_name)
+        if strip_name:
+            track.strips.remove(self._get_nla_strip(track, strip_name))
+        else:
+            anim.nla_tracks.remove(track)
+        return self._nla_result(obj, owner)
+
+    def set_nla_track(self, object_name, track_name, target="object", mute=None, solo=None, name=None):
+        """Mute, solo or rename an NLA track."""
+        obj = self._get_object(object_name)
+        owner = self._get_nla_owner(obj, target)
+        track = self._get_nla_track(owner.animation_data, track_name)
+        if mute is not None:
+            track.mute = bool(mute)
+        if solo is not None:
+            track.is_solo = bool(solo)
+        if name:
+            track.name = name
+        return self._nla_result(obj, owner)
 
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""

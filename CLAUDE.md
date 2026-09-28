@@ -50,6 +50,18 @@ Blender is available as a Python module (`pip install bpy`, Python 3.11 for Blen
 - **`set_timeline`** — Sets frame range, fps and current frame.
 - **`scrub_timeline`** — Jumps to a (fractional) frame and returns the evaluated world transforms (incl. parents and constraints), visibility, camera focal length and light energy of all objects that can move.
 
+- **`render_animation_preview`** — Renders up to 25 evenly spaced frames into one contact sheet (grid, each tile labeled with its frame number) so Claude Vision can judge motion at a glance. Async like `render_scene`: fetch the sheet with `poll_render_status`. Frames render one per timer tick, so polls report progress (`frames_done`/`frames_total`) between frames. Render settings and the current frame are restored afterwards.
+
+### NLA (Nonlinear Animation)
+
+- **`push_action_to_nla`** — Pushes the active action down into a new NLA track (like "Push Down" in the UI).
+- **`add_nla_strip`** — Places an existing action as a strip at a frame, with repeat, time scale, blend type, extrapolation and blend in/out.
+- **`update_nla_strip`** — Moves a strip (keeping its length) or changes its settings; can mute it.
+- **`set_nla_track`** — Mutes, solos or renames a track.
+- **`remove_nla`** — Removes a strip, or a whole track if no strip is given (the action stays in the file).
+
+All NLA tools take `target="data"` to work on the data block's animation (light, camera, ...).
+
 Fcurve access is slot-aware and works with layered actions (Blender 4.4+/5.x) and legacy actions. Snapshots include keyframes of the object's data block under `data.` paths.
 
 ### Batch Script Execution
@@ -68,11 +80,10 @@ Fcurve access is slot-aware and works with layered actions (Blender 4.4+/5.x) an
 1. **Snapshot** the scene before making changes (`snapshot_scene`)
 2. Make modifications (via `execute_blender_code`, the animation tools, or manually in Blender)
 3. **Diff** to see exactly what changed (`diff_scene`) or check the automatic **change log** (`get_change_log`)
-4. **Render** the scene (`render_scene`, then `poll_render_status` until complete) and **review** it (`review_render`) — Claude sees the image and provides feedback on composition, lighting, materials
+4. **Render** the scene (`render_scene`, then `poll_render_status` until complete) and **review** it (`review_render`) — Claude sees the image and provides feedback on composition, lighting, materials. For animations, use `render_animation_preview` to review motion as a contact sheet
 5. Iterate: apply improvements, render again, compare
 6. **Clear** the change log when satisfied (`clear_change_log`)
 
 ## Roadmap
 
-- **Animation workflow** — Remaining: animation preview rendering (sampled frames as a contact sheet for Claude Vision) and NLA strip management (keyframes and timeline tools are done)
 - **Scientific visualization** — Support for visualizing magnetic fields, force fields, dynamic physical systems (particle systems, fluid simulations, rigid body dynamics)

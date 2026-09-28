@@ -486,6 +486,46 @@ def poll_render_status(ctx: Context) -> list:
         return [f"Error polling render status: {str(e)}"]
 
 
+@telemetry_tool("render_animation_preview")
+@mcp.tool()
+def render_animation_preview(ctx: Context, frame_start: int = None, frame_end: int = None,
+                             num_frames: int = 9, columns: int = None,
+                             resolution_x: int = 480, resolution_y: int = 270,
+                             engine: str = "EEVEE", samples: int = None) -> str:
+    """
+    Start rendering evenly spaced frames of the animation into one contact sheet
+    (grid image, each tile labeled with its frame number) for reviewing motion at a glance.
+    Returns immediately; call poll_render_status to see progress (frames_done/frames_total)
+    and to get the contact sheet when complete. review_render also shows it afterwards.
+    Frames are rendered one per Blender timer tick, so polls are answered between frames.
+
+    Parameters:
+    - frame_start: First frame (default: scene start)
+    - frame_end: Last frame (default: scene end)
+    - num_frames: Number of frames to sample, 1-25 (default: 9)
+    - columns: Grid columns (default: square-ish grid)
+    - resolution_x / resolution_y: Size of each tile in pixels (default: 480x270)
+    - engine: "EEVEE" or "CYCLES" (default: "EEVEE")
+    - samples: Render samples per frame (default: 32 for EEVEE, 64 for Cycles)
+    """
+    try:
+        blender = get_blender_connection()
+        temp_path = os.path.join(tempfile.gettempdir(), f"blender_preview_{os.getpid()}.png")
+        params = {"filepath": temp_path, "num_frames": num_frames,
+                  "resolution_x": resolution_x, "resolution_y": resolution_y, "engine": engine}
+        for key, value in {"frame_start": frame_start, "frame_end": frame_end,
+                           "columns": columns, "samples": samples}.items():
+            if value is not None:
+                params[key] = value
+        result = blender.send_command("render_animation_preview", params, timeout=30)
+        if "error" in result:
+            raise Exception(result["error"])
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error starting animation preview: {str(e)}")
+        return f"Error starting animation preview: {str(e)}"
+
+
 @telemetry_tool("execute_batch_script")
 @mcp.tool()
 def execute_batch_script(ctx: Context, code: str = "") -> str:
@@ -662,6 +702,122 @@ def scrub_timeline(ctx: Context, frame: float, object_names: List[str] = None) -
     except Exception as e:
         logger.error(f"Error scrubbing timeline: {str(e)}")
         return f"Error scrubbing timeline: {str(e)}"
+
+
+def _nla_command(command: str, params: Dict[str, Any], label: str) -> str:
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command(command, {k: v for k, v in params.items() if v is not None})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error {label}: {str(e)}")
+        return f"Error {label}: {str(e)}"
+
+
+@telemetry_tool("push_action_to_nla")
+@mcp.tool()
+def push_action_to_nla(ctx: Context, object_name: str, target: str = "object",
+                       track_name: str = None, strip_name: str = None) -> str:
+    """
+    Push the active action of an object down into a new NLA track (like "Push Down"
+    in Blender). The action keeps animating as a strip and the object is free for a new action.
+
+    Parameters:
+    - object_name: Name of the object
+    - target: "object" (default) or "data" for the data block's action (light, camera, ...)
+    - track_name: Name for the new track (optional)
+    - strip_name: Name for the strip (default: action name)
+    """
+    return _nla_command("push_action_to_nla", {"object_name": object_name, "target": target,
+                        "track_name": track_name, "strip_name": strip_name}, "pushing action to NLA")
+
+
+@telemetry_tool("add_nla_strip")
+@mcp.tool()
+def add_nla_strip(ctx: Context, object_name: str, action_name: str, frame_start: int,
+                  target: str = "object", track_name: str = None, strip_name: str = None,
+                  repeat: float = None, scale: float = None, blend_type: str = None,
+                  extrapolation: str = None, blend_in: float = None, blend_out: float = None) -> str:
+    """
+    Place an existing action as a strip in the NLA, e.g. to reuse a walk cycle or
+    sequence several actions. Fails if the strip would overlap another strip on the track.
+
+    Parameters:
+    - object_name: Name of the object
+    - action_name: Name of the action (see get_animation_data for existing actions)
+    - frame_start: Frame where the strip starts
+    - target: "object" (default) or "data"
+    - track_name: Existing track to use; a new track is created if missing or omitted
+    - strip_name: Strip name (default: action name)
+    - repeat: Number of repetitions of the action
+    - scale: Time scale (2.0 = half speed)
+    - blend_type: REPLACE, COMBINE, ADD, SUBTRACT or MULTIPLY
+    - extrapolation: HOLD, HOLD_FORWARD or NOTHING
+    - blend_in / blend_out: Frames to fade the strip in/out
+    """
+    return _nla_command("add_nla_strip", {
+        "object_name": object_name, "action_name": action_name, "frame_start": frame_start,
+        "target": target, "track_name": track_name, "strip_name": strip_name, "repeat": repeat,
+        "scale": scale, "blend_type": blend_type, "extrapolation": extrapolation,
+        "blend_in": blend_in, "blend_out": blend_out}, "adding NLA strip")
+
+
+@telemetry_tool("update_nla_strip")
+@mcp.tool()
+def update_nla_strip(ctx: Context, object_name: str, track_name: str, strip_name: str,
+                     target: str = "object", frame_start: float = None, repeat: float = None,
+                     scale: float = None, blend_type: str = None, extrapolation: str = None,
+                     blend_in: float = None, blend_out: float = None, mute: bool = None) -> str:
+    """
+    Move or change an NLA strip. Only the given values are changed.
+
+    Parameters:
+    - object_name, track_name, strip_name: Identify the strip
+    - target: "object" (default) or "data"
+    - frame_start: New start frame (moves the strip, keeps its length)
+    - repeat, scale, blend_type, extrapolation, blend_in, blend_out: See add_nla_strip
+    - mute: Mute or unmute the strip
+    """
+    return _nla_command("update_nla_strip", {
+        "object_name": object_name, "track_name": track_name, "strip_name": strip_name,
+        "target": target, "frame_start": frame_start, "repeat": repeat, "scale": scale,
+        "blend_type": blend_type, "extrapolation": extrapolation, "blend_in": blend_in,
+        "blend_out": blend_out, "mute": mute}, "updating NLA strip")
+
+
+@telemetry_tool("set_nla_track")
+@mcp.tool()
+def set_nla_track(ctx: Context, object_name: str, track_name: str, target: str = "object",
+                  mute: bool = None, solo: bool = None, name: str = None) -> str:
+    """
+    Mute, solo or rename an NLA track.
+
+    Parameters:
+    - object_name, track_name: Identify the track
+    - target: "object" (default) or "data"
+    - mute: Mute or unmute the whole track
+    - solo: Play only this track
+    - name: New track name
+    """
+    return _nla_command("set_nla_track", {"object_name": object_name, "track_name": track_name,
+                        "target": target, "mute": mute, "solo": solo, "name": name}, "setting NLA track")
+
+
+@telemetry_tool("remove_nla")
+@mcp.tool()
+def remove_nla(ctx: Context, object_name: str, track_name: str, strip_name: str = None,
+               target: str = "object") -> str:
+    """
+    Remove an NLA strip, or the whole track if strip_name is omitted.
+    The action itself is kept in the file.
+
+    Parameters:
+    - object_name, track_name: Identify the track
+    - strip_name: Strip to remove (omit to remove the whole track)
+    - target: "object" (default) or "data"
+    """
+    return _nla_command("remove_nla", {"object_name": object_name, "track_name": track_name,
+                        "strip_name": strip_name, "target": target}, "removing NLA strip/track")
 
 
 @telemetry_tool("review_render")

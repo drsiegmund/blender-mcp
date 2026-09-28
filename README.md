@@ -14,10 +14,10 @@ snapshot_scene → make changes → diff_scene → see what changed
 ```
 
 ### Render Feedback Loop
-Trigger real Blender renders (EEVEE or Cycles) from Claude and get visual feedback. Claude sees the rendered image alongside scene metadata and can suggest improvements to composition, lighting, and materials.
+Trigger real Blender renders (EEVEE or Cycles) from Claude and get visual feedback. `render_scene` returns immediately; the result is fetched with `poll_render_status`. Claude sees the rendered image alongside scene metadata and can suggest improvements to composition, lighting, and materials.
 
 ```
-render_scene → review_render → apply feedback → render again
+render_scene → poll_render_status → review_render → apply feedback → render again
 ```
 
 ### Depsgraph Change Detection
@@ -35,7 +35,7 @@ Snapshots and diffs now capture object constraints (Track To, Follow Path, Copy 
 1. **Snapshot** the scene before making changes (`snapshot_scene`)
 2. **Modify** the scene — via `execute_blender_code` or manually in Blender
 3. **Detect changes** with `diff_scene` (explicit) or `get_change_log` (automatic)
-4. **Render** the scene (`render_scene`) and **review** it (`review_render`)
+4. **Render** the scene (`render_scene`, then `poll_render_status`) and **review** it (`review_render`)
 5. **Iterate** — Claude analyzes the render and suggests improvements
 6. **Clear** the change log when satisfied (`clear_change_log`)
 
@@ -47,12 +47,15 @@ Snapshots and diffs now capture object constraints (Track To, Follow Path, Copy 
 | `diff_scene` | Compare current state against last snapshot |
 | `get_change_log` | Get automatically collected change events |
 | `clear_change_log` | Reset the change log |
-| `render_scene` | Render with EEVEE/Cycles (configurable resolution, samples) |
+| `render_scene` | Start an async render with EEVEE/Cycles (configurable resolution, samples) |
+| `poll_render_status` | Check the async render; returns the image when complete |
 | `review_render` | Get last render or viewport screenshot with scene metadata |
 | `get_scene_info` | Quick scene overview (object count, materials) |
 | `get_object_info` | Detailed info for a single object (incl. constraints, modifiers) |
 | `get_viewport_screenshot` | Capture the 3D viewport |
 | `execute_blender_code` | Run arbitrary Python in Blender |
+| `execute_batch_script` | Run a long Python script asynchronously |
+| `poll_batch_status` | Check the async batch script; returns its output when complete |
 
 ## Installation
 

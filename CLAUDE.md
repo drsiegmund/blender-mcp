@@ -35,6 +35,7 @@ python -m pytest tests
 - Renders in tests use Cycles on the CPU (EEVEE needs a GPU/EGL).
 - `tests/test_server_e2e.py` runs the MCP tool functions from `server.py` against `tests/fake_blender.py`, a subprocess that serves the add-on dispatcher over TCP.
 - GitHub Actions (`.github/workflows/tests.yml`) runs the suite on every push and pull request.
+- `tests/live_check.py` checks a running Blender without Claude: start the add-on server, run `python3 tests/live_check.py` (stdlib only). It works in a new scene `MCP_Live_Test`, measures poll latency during renders (EEVEE, timers, real socket loop) and writes `report.md` plus images to `~/blender_mcp_live_check/`.
 - Keep `mcp` pinned below 2.x: `FastMCP` was renamed in mcp 2 and the server fails to import.
 
 ## Custom MCP Tools

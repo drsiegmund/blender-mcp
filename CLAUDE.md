@@ -20,6 +20,10 @@ Extend the MCP server with a collaborative workflow featuring:
 
 - Commit messages in English
 
+## Testing Without a Blender GUI
+
+Blender is available as a Python module (`pip install bpy`, Python 3.11 for Blender 5.0). The add-on handlers can be tested headlessly by loading `addon.py` via `importlib` and calling `BlenderMCPServer` methods directly. `bpy.app.timers` do not fire in module mode, so the socket loop itself (and async render/batch) needs a real Blender.
+
 ## Custom MCP Tools
 
 ### Scene Snapshot & Diff
@@ -38,6 +42,16 @@ Extend the MCP server with a collaborative workflow featuring:
 - **`get_change_log`** — Returns automatically collected scene changes. A `depsgraph_update_post` handler runs in the background while the server is active, logging transform, geometry, and shading updates per object. Summary mode (default) aggregates events; detail mode returns raw entries.
 - **`clear_change_log`** — Resets the change log. Use after reviewing changes to establish a fresh baseline.
 
+### Animation & Timeline
+
+- **`insert_keyframes`** — Inserts keyframes on any animatable property (`location`, `rotation_euler`, `modifiers["Array"].count`, `["custom_prop"]`, ...) with optional values and per-key interpolation. A `data.` prefix targets the object's data block (`data.energy` for lights, `data.lens` for cameras).
+- **`delete_keyframes`** — Deletes keys by property, frame and/or vector component; removes fcurves that end up empty.
+- **`get_animation_data`** — Returns fcurves with frame, value and interpolation per key, assigned actions/slots, NLA tracks and drivers for one or all animated objects, plus the timeline.
+- **`set_timeline`** — Sets frame range, fps and current frame.
+- **`scrub_timeline`** — Jumps to a (fractional) frame and returns the evaluated world transforms (incl. parents and constraints), visibility, camera focal length and light energy of all objects that can move.
+
+Fcurve access is slot-aware and works with layered actions (Blender 4.4+/5.x) and legacy actions. Snapshots include keyframes of the object's data block under `data.` paths.
+
 ### Batch Script Execution
 
 - **`execute_batch_script`** — Runs a long-running Python script in Blender asynchronously (via `bpy.app.timers`) and returns a batch ID immediately. Use instead of `execute_blender_code` for scripts that would exceed the socket timeout (e.g. baking, simulations, heavy geometry generation). Only one batch runs at a time.
@@ -52,7 +66,7 @@ Extend the MCP server with a collaborative workflow featuring:
 ## Collaborative Workflow
 
 1. **Snapshot** the scene before making changes (`snapshot_scene`)
-2. Make modifications (via `execute_blender_code` or manually in Blender)
+2. Make modifications (via `execute_blender_code`, the animation tools, or manually in Blender)
 3. **Diff** to see exactly what changed (`diff_scene`) or check the automatic **change log** (`get_change_log`)
 4. **Render** the scene (`render_scene`, then `poll_render_status` until complete) and **review** it (`review_render`) — Claude sees the image and provides feedback on composition, lighting, materials
 5. Iterate: apply improvements, render again, compare
@@ -60,5 +74,5 @@ Extend the MCP server with a collaborative workflow featuring:
 
 ## Roadmap
 
-- **Animation workflow** — Tools for keyframe insertion, timeline scrubbing, animation preview rendering, and NLA strip management
+- **Animation workflow** — Remaining: animation preview rendering (sampled frames as a contact sheet for Claude Vision) and NLA strip management (keyframes and timeline tools are done)
 - **Scientific visualization** — Support for visualizing magnetic fields, force fields, dynamic physical systems (particle systems, fluid simulations, rigid body dynamics)

@@ -251,6 +251,11 @@ class BlenderMCPServer:
             "poll_render_status": self.poll_render_status,
             "execute_batch_script": self.execute_batch_script,
             "poll_batch_status": self.poll_batch_status,
+            "insert_keyframes": self.insert_keyframes,
+            "delete_keyframes": self.delete_keyframes,
+            "get_animation_data": self.get_animation_data,
+            "set_timeline": self.set_timeline,
+            "scrub_timeline": self.scrub_timeline,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
             "get_telemetry_consent": self.get_telemetry_consent,
@@ -422,30 +427,48 @@ class BlenderMCPServer:
             return "BLENDER_EEVEE"
         return "CYCLES"
 
-    def _get_fcurves(self, action):
-        """Get fcurves from an action, handling both layered (Blender 4.x) and legacy actions."""
-        if hasattr(action, 'is_action_layered') and action.is_action_layered:
-            try:
-                return action.layers[0].strips[0].channelbags[0].fcurves
-            except (IndexError, AttributeError):
-                return []
-        if hasattr(action, 'fcurves'):
-            return action.fcurves
-        return []
+    def _get_fcurve_collection(self, id_block):
+        """Get the fcurve collection animating an ID block (object, light, camera, ...).
+
+        Handles layered actions with slots (Blender 4.4+) and legacy actions.
+        Returns None if the ID has no action.
+        """
+        anim = getattr(id_block, "animation_data", None)
+        if not anim or not anim.action:
+            return None
+        action = anim.action
+        if getattr(action, "is_action_layered", False):
+            slot = getattr(anim, "action_slot", None)
+            for layer in action.layers:
+                for strip in layer.strips:
+                    if slot is not None:
+                        channelbag = strip.channelbag(slot)
+                    else:
+                        channelbag = strip.channelbags[0] if len(strip.channelbags) else None
+                    if channelbag:
+                        return channelbag.fcurves
+            return None
+        return getattr(action, "fcurves", None)
+
+    def _get_fcurves(self, id_block):
+        """Get the fcurves animating an ID block as a list."""
+        fcurves = self._get_fcurve_collection(id_block)
+        return list(fcurves) if fcurves is not None else []
+
+    def _get_anim_targets(self, obj):
+        """Yield (id_block, path_prefix) for an object and its data block."""
+        yield obj, ""
+        if obj.data is not None and hasattr(obj.data, "animation_data"):
+            yield obj.data, "data."
 
     def _get_keyframes(self, obj):
-        """Extract keyframe data for an object, grouped by data_path."""
+        """Extract keyframe frames for an object and its data, grouped by data_path."""
         keyframes = {}
-        if not obj.animation_data or not obj.animation_data.action:
-            return keyframes
-        fcurves = self._get_fcurves(obj.animation_data.action)
-        for fc in fcurves:
-            path = fc.data_path
-            frames = sorted(set(round(kf.co[0]) for kf in fc.keyframe_points))
-            if path in keyframes:
-                keyframes[path] = sorted(set(keyframes[path] + frames))
-            else:
-                keyframes[path] = frames
+        for target, prefix in self._get_anim_targets(obj):
+            for fc in self._get_fcurves(target):
+                path = prefix + fc.data_path
+                frames = sorted(set(round(kf.co[0]) for kf in fc.keyframe_points))
+                keyframes[path] = sorted(set(keyframes.get(path, []) + frames))
         return keyframes
 
     def _get_material_props(self, mat):
@@ -968,6 +991,311 @@ class BlenderMCPServer:
             "status": self._batch_status or "idle",
             "result": self._batch_result,
         }
+
+    # ---- Animation & Timeline ----
+
+    _INTERPOLATIONS = {
+        'CONSTANT', 'LINEAR', 'BEZIER', 'SINE', 'QUAD', 'CUBIC', 'QUART',
+        'QUINT', 'EXPO', 'CIRC', 'BACK', 'BOUNCE', 'ELASTIC',
+    }
+
+    def _get_object(self, object_name):
+        obj = bpy.data.objects.get(object_name)
+        if not obj:
+            raise ValueError(f"Object not found: {object_name}")
+        return obj
+
+    def _resolve_anim_target(self, obj, data_path):
+        """Map a data_path to (id_block, path). A "data." prefix targets obj.data."""
+        if data_path.startswith("data."):
+            if obj.data is None:
+                raise ValueError(f"Object '{obj.name}' has no data block")
+            return obj.data, data_path[len("data."):]
+        return obj, data_path
+
+    def _set_path_value(self, target, path, value, index):
+        """Set the value of an animatable property given by an RNA path."""
+        custom = re.match(r'^(.*)\[(["\'])(.+)\2\]$', path)
+        if custom:
+            owner = target.path_resolve(custom.group(1)) if custom.group(1) else target
+            key = custom.group(3)
+            if index >= 0:
+                owner[key][index] = value
+            else:
+                owner[key] = value
+            return
+        match = re.match(r'^(.*?)\.?([A-Za-z_]\w*)$', path)
+        if not match:
+            raise ValueError(f"Unsupported data_path: {path}")
+        owner = target.path_resolve(match.group(1)) if match.group(1) else target
+        attr = match.group(2)
+        if index >= 0:
+            getattr(owner, attr)[index] = value
+        else:
+            setattr(owner, attr, value)
+
+    def _serialize_fcurve(self, fc, prefix="", max_keyframes=100):
+        points = fc.keyframe_points
+        data = {
+            "data_path": prefix + fc.data_path,
+            "index": fc.array_index,
+            "keyframe_count": len(points),
+            "extrapolation": fc.extrapolation,
+            "keyframes": [
+                {
+                    "frame": round(float(kp.co[0]), 3),
+                    "value": round(float(kp.co[1]), 4),
+                    "interpolation": kp.interpolation,
+                }
+                for kp in list(points)[:max_keyframes]
+            ],
+        }
+        if len(points) > max_keyframes:
+            data["truncated"] = True
+        if fc.mute:
+            data["mute"] = True
+        return data
+
+    def _serialize_nla(self, anim):
+        tracks = []
+        if not anim:
+            return tracks
+        for track in anim.nla_tracks:
+            tracks.append({
+                "name": track.name,
+                "mute": track.mute,
+                "is_solo": track.is_solo,
+                "strips": [
+                    {
+                        "name": strip.name,
+                        "action": strip.action.name if strip.action else None,
+                        "frame_start": round(float(strip.frame_start), 3),
+                        "frame_end": round(float(strip.frame_end), 3),
+                        "blend_type": strip.blend_type,
+                        "repeat": round(float(strip.repeat), 3),
+                        "scale": round(float(strip.scale), 3),
+                        "mute": strip.mute,
+                    }
+                    for strip in track.strips
+                ],
+            })
+        return tracks
+
+    def _get_timeline(self):
+        scene = bpy.context.scene
+        return {
+            "frame_start": scene.frame_start,
+            "frame_end": scene.frame_end,
+            "frame_current": scene.frame_current,
+            "fps": scene.render.fps,
+            "fps_base": round(float(scene.render.fps_base), 4),
+            "effective_fps": round(scene.render.fps / scene.render.fps_base, 3),
+        }
+
+    def _has_animation(self, obj):
+        for target, _ in self._get_anim_targets(obj):
+            anim = getattr(target, "animation_data", None)
+            if anim and (anim.action or len(anim.nla_tracks) or len(anim.drivers)):
+                return True
+        return False
+
+    def _is_dynamic(self, obj):
+        """True if the object's transform can change over time."""
+        while obj is not None:
+            if self._has_animation(obj) or len(obj.constraints):
+                return True
+            obj = obj.parent
+        return False
+
+    def insert_keyframes(self, object_name, data_path, keyframes, index=-1, interpolation=None):
+        """Insert keyframes on an object (or its data via a "data." prefix).
+
+        keyframes: list of {"frame": number, "value": optional scalar or list,
+                            "interpolation": optional}
+        """
+        obj = self._get_object(object_name)
+        target, path = self._resolve_anim_target(obj, data_path)
+        try:
+            target.path_resolve(path)
+        except ValueError:
+            raise ValueError(f"Invalid data_path '{data_path}' for object '{object_name}'")
+        if not keyframes:
+            raise ValueError("No keyframes given")
+        if interpolation and interpolation.upper() not in self._INTERPOLATIONS:
+            raise ValueError(f"Invalid interpolation: {interpolation}. Use one of {sorted(self._INTERPOLATIONS)}")
+
+        scene = bpy.context.scene
+        inserted = []
+        interp_by_frame = {}
+        for kf in keyframes:
+            if "frame" not in kf:
+                raise ValueError(f"Keyframe without 'frame': {kf}")
+            frame = float(kf["frame"])
+            if "value" in kf and kf["value"] is not None:
+                self._set_path_value(target, path, kf["value"], index)
+            if not target.keyframe_insert(data_path=path, index=index, frame=frame):
+                raise RuntimeError(f"Could not insert keyframe for '{data_path}' at frame {frame}")
+            inserted.append(frame)
+            kf_interp = kf.get("interpolation") or interpolation
+            if kf_interp:
+                kf_interp = kf_interp.upper()
+                if kf_interp not in self._INTERPOLATIONS:
+                    raise ValueError(f"Invalid interpolation: {kf_interp}")
+                interp_by_frame[frame] = kf_interp
+
+        fcurves = [fc for fc in self._get_fcurves(target)
+                   if fc.data_path == path and (index < 0 or fc.array_index == index)]
+        for fc in fcurves:
+            for kp in fc.keyframe_points:
+                interp = interp_by_frame.get(float(kp.co[0]))
+                if interp:
+                    kp.interpolation = interp
+            fc.update()
+
+        # Re-evaluate so the scene shows the animated state of the current frame
+        scene.frame_set(scene.frame_current)
+
+        prefix = "data." if target is not obj else ""
+        return {
+            "object": obj.name,
+            "data_path": data_path,
+            "inserted_frames": inserted,
+            "fcurves": [self._serialize_fcurve(fc, prefix) for fc in fcurves],
+        }
+
+    def delete_keyframes(self, object_name, data_path=None, frames=None, index=-1):
+        """Delete keyframes. Without data_path all channels, without frames all keys."""
+        obj = self._get_object(object_name)
+        if data_path:
+            target, path = self._resolve_anim_target(obj, data_path)
+            targets = [(target, path, "data." if target is not obj else "")]
+        else:
+            targets = [(t, None, prefix) for t, prefix in self._get_anim_targets(obj)]
+
+        frame_set = {round(float(f), 3) for f in frames} if frames is not None else None
+        removed = {}
+        for target, path, prefix in targets:
+            collection = self._get_fcurve_collection(target)
+            if collection is None:
+                continue
+            for fc in list(collection):
+                if path is not None and fc.data_path != path:
+                    continue
+                if index >= 0 and fc.array_index != index:
+                    continue
+                points = fc.keyframe_points
+                count = 0
+                for kp in reversed(list(points)):
+                    if frame_set is None or round(float(kp.co[0]), 3) in frame_set:
+                        points.remove(kp, fast=True)
+                        count += 1
+                if count:
+                    key = f"{prefix}{fc.data_path}[{fc.array_index}]"
+                    removed[key] = count
+                if len(points) == 0:
+                    collection.remove(fc)
+                else:
+                    fc.update()
+
+        scene = bpy.context.scene
+        scene.frame_set(scene.frame_current)
+        return {
+            "object": obj.name,
+            "removed": removed,
+            "removed_total": sum(removed.values()),
+        }
+
+    def get_animation_data(self, object_name=None, max_keyframes=100):
+        """Return fcurves, keyframe values and NLA tracks of one or all animated objects."""
+        if object_name:
+            objects = [self._get_object(object_name)]
+        else:
+            objects = [o for o in bpy.context.scene.objects if self._has_animation(o)]
+
+        result = {"timeline": self._get_timeline(), "objects": {}}
+        for obj in objects:
+            obj_data = {"fcurves": [], "actions": {}, "nla_tracks": {}, "drivers": []}
+            frames = []
+            for target, prefix in self._get_anim_targets(obj):
+                anim = getattr(target, "animation_data", None)
+                if not anim:
+                    continue
+                key = prefix.rstrip(".") or "object"
+                if anim.action:
+                    obj_data["actions"][key] = {
+                        "action": anim.action.name,
+                        "slot": anim.action_slot.name_display if getattr(anim, "action_slot", None) else None,
+                    }
+                for fc in self._get_fcurves(target):
+                    obj_data["fcurves"].append(self._serialize_fcurve(fc, prefix, max_keyframes))
+                    frames.extend(float(kp.co[0]) for kp in fc.keyframe_points)
+                nla = self._serialize_nla(anim)
+                if nla:
+                    obj_data["nla_tracks"][key] = nla
+                for drv in anim.drivers:
+                    obj_data["drivers"].append({
+                        "data_path": prefix + drv.data_path,
+                        "index": drv.array_index,
+                        "expression": drv.driver.expression if drv.driver.type == 'SCRIPTED' else drv.driver.type,
+                    })
+            if frames:
+                obj_data["frame_range"] = [min(frames), max(frames)]
+            result["objects"][obj.name] = obj_data
+        return result
+
+    def set_timeline(self, frame_start=None, frame_end=None, fps=None, frame_current=None):
+        """Set scene frame range, frame rate and/or current frame."""
+        scene = bpy.context.scene
+        start = frame_start if frame_start is not None else scene.frame_start
+        end = frame_end if frame_end is not None else scene.frame_end
+        if start > end:
+            raise ValueError(f"frame_start ({start}) must not be greater than frame_end ({end})")
+        # Set in an order that never makes start > end temporarily
+        if frame_end is not None and frame_end < scene.frame_start:
+            scene.frame_start = start
+            scene.frame_end = end
+        else:
+            scene.frame_end = end
+            scene.frame_start = start
+        if fps is not None:
+            if fps < 1:
+                raise ValueError("fps must be at least 1")
+            scene.render.fps = int(fps)
+            scene.render.fps_base = 1.0
+        if frame_current is not None:
+            scene.frame_set(int(frame_current))
+        return self._get_timeline()
+
+    def scrub_timeline(self, frame, object_names=None):
+        """Jump to a frame and return the evaluated state of animated objects."""
+        scene = bpy.context.scene
+        frame = float(frame)
+        whole = int(frame // 1)
+        scene.frame_set(whole, subframe=frame - whole)
+
+        if object_names:
+            objects = [self._get_object(name) for name in object_names]
+        else:
+            objects = [o for o in scene.objects if self._is_dynamic(o)]
+
+        states = {}
+        for obj in objects:
+            loc, rot, scale = obj.matrix_world.decompose()
+            state = {
+                "world_location": self._round_vec(loc),
+                "world_rotation": self._round_vec(rot.to_euler()),
+                "world_scale": self._round_vec(scale),
+                "visible": obj.visible_get(),
+                "hide_render": obj.hide_render,
+            }
+            if obj.type == 'CAMERA':
+                state["focal_length"] = round(float(obj.data.lens), 4)
+            elif obj.type == 'LIGHT':
+                state["energy"] = round(float(obj.data.energy), 4)
+                state["color"] = self._round_vec(obj.data.color)
+            states[obj.name] = state
+
+        return {"frame": frame, "timeline": self._get_timeline(), "objects": states}
 
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""

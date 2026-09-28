@@ -528,6 +528,142 @@ def poll_batch_status(ctx: Context) -> str:
         return f"Error polling batch status: {str(e)}"
 
 
+@telemetry_tool("insert_keyframes")
+@mcp.tool()
+def insert_keyframes(ctx: Context, object_name: str, data_path: str, keyframes: List[Dict[str, Any]],
+                     index: int = -1, interpolation: str = None) -> str:
+    """
+    Insert keyframes on an object property.
+
+    Parameters:
+    - object_name: Name of the object to animate
+    - data_path: RNA path of the property, e.g. "location", "rotation_euler", "scale",
+      "hide_render", 'modifiers["Array"].count', '["my_prop"]'. Prefix with "data." to
+      animate the object's data block, e.g. "data.energy" (light), "data.lens" (camera).
+    - keyframes: List of {"frame": number, "value": optional, "interpolation": optional}.
+      "value" is a list for vector properties (index=-1) or a number for a single
+      component (index>=0) or scalar property. Without "value" the current value is keyed.
+    - index: Vector component to key (0=X, 1=Y, 2=Z), or -1 for all components (default)
+    - interpolation: Default interpolation for the new keys: CONSTANT, LINEAR, BEZIER,
+      SINE, QUAD, CUBIC, QUART, QUINT, EXPO, CIRC, BACK, BOUNCE, ELASTIC
+
+    Returns the resulting fcurves with all keyframes of the property.
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"object_name": object_name, "data_path": data_path,
+                  "keyframes": keyframes, "index": index}
+        if interpolation:
+            params["interpolation"] = interpolation
+        result = blender.send_command("insert_keyframes", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error inserting keyframes: {str(e)}")
+        return f"Error inserting keyframes: {str(e)}"
+
+
+@telemetry_tool("delete_keyframes")
+@mcp.tool()
+def delete_keyframes(ctx: Context, object_name: str, data_path: str = None,
+                     frames: List[float] = None, index: int = -1) -> str:
+    """
+    Delete keyframes from an object. Empty fcurves are removed.
+
+    Parameters:
+    - object_name: Name of the object
+    - data_path: Property to delete keys from (same format as insert_keyframes).
+      If omitted, all animated properties of the object and its data are affected.
+    - frames: Frames to delete keys at. If omitted, all keys are deleted.
+    - index: Vector component (0=X, 1=Y, 2=Z), or -1 for all components (default)
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"object_name": object_name, "index": index}
+        if data_path:
+            params["data_path"] = data_path
+        if frames is not None:
+            params["frames"] = frames
+        result = blender.send_command("delete_keyframes", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error deleting keyframes: {str(e)}")
+        return f"Error deleting keyframes: {str(e)}"
+
+
+@telemetry_tool("get_animation_data")
+@mcp.tool()
+def get_animation_data(ctx: Context, object_name: str = None, max_keyframes: int = 100) -> str:
+    """
+    Get detailed animation data: fcurves with keyframe frames, values and
+    interpolation, assigned actions, NLA tracks and drivers, plus the timeline.
+    Covers the object and its data block (light energy, camera lens, ...).
+
+    Parameters:
+    - object_name: Object to inspect. If omitted, all animated objects in the scene.
+    - max_keyframes: Maximum keyframes listed per fcurve (default: 100)
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"max_keyframes": max_keyframes}
+        if object_name:
+            params["object_name"] = object_name
+        result = blender.send_command("get_animation_data", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting animation data: {str(e)}")
+        return f"Error getting animation data: {str(e)}"
+
+
+@telemetry_tool("set_timeline")
+@mcp.tool()
+def set_timeline(ctx: Context, frame_start: int = None, frame_end: int = None,
+                 fps: int = None, frame_current: int = None) -> str:
+    """
+    Set the scene timeline. Only the given values are changed.
+
+    Parameters:
+    - frame_start: First frame of the animation range
+    - frame_end: Last frame of the animation range
+    - fps: Frame rate (sets fps_base to 1.0)
+    - frame_current: Frame to jump to
+    """
+    try:
+        blender = get_blender_connection()
+        params = {k: v for k, v in {"frame_start": frame_start, "frame_end": frame_end,
+                                    "fps": fps, "frame_current": frame_current}.items()
+                  if v is not None}
+        result = blender.send_command("set_timeline", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting timeline: {str(e)}")
+        return f"Error setting timeline: {str(e)}"
+
+
+@telemetry_tool("scrub_timeline")
+@mcp.tool()
+def scrub_timeline(ctx: Context, frame: float, object_names: List[str] = None) -> str:
+    """
+    Jump to a frame and return the evaluated state of objects at that frame:
+    world location/rotation/scale (including parents and constraints), visibility,
+    camera focal length and light energy/color. Leaves the scene at that frame.
+
+    Parameters:
+    - frame: Frame to evaluate (fractional frames are supported, e.g. 12.5)
+    - object_names: Objects to report. If omitted, all objects whose transform can
+      change over time (animated, constrained, or with such a parent).
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"frame": frame}
+        if object_names:
+            params["object_names"] = object_names
+        result = blender.send_command("scrub_timeline", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error scrubbing timeline: {str(e)}")
+        return f"Error scrubbing timeline: {str(e)}"
+
+
 @telemetry_tool("review_render")
 @mcp.tool()
 def review_render(ctx: Context, source: str = "render", max_size: int = 1280) -> list:

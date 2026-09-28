@@ -27,6 +27,13 @@ A background handler (`depsgraph_update_post`) continuously logs scene changes w
 clear_change_log → work in Blender → get_change_log → see all changes
 ```
 
+### Animation & Timeline
+Insert and delete keyframes on any animatable property (including light energy and camera focal length via `data.` paths), inspect fcurves, NLA tracks and drivers, set the frame range and fps, and scrub to any frame to see where everything is.
+
+```
+insert_keyframes → set_timeline → scrub_timeline → get_animation_data
+```
+
 ### Constraints & Modifiers
 Snapshots and diffs now capture object constraints (Track To, Follow Path, Copy Location, etc.) and modifiers (Subdivision, Array, Mirror, Solidify, etc.) with type-specific parameters. Essential for animation workflows where camera paths are driven by constraints.
 
@@ -50,6 +57,11 @@ Snapshots and diffs now capture object constraints (Track To, Follow Path, Copy 
 | `render_scene` | Start an async render with EEVEE/Cycles (configurable resolution, samples) |
 | `poll_render_status` | Check the async render; returns the image when complete |
 | `review_render` | Get last render or viewport screenshot with scene metadata |
+| `insert_keyframes` | Insert keyframes with values and interpolation |
+| `delete_keyframes` | Delete keyframes by property, frame or component |
+| `get_animation_data` | Fcurves, keyframe values, actions, NLA tracks, drivers |
+| `set_timeline` | Set frame range, fps and current frame |
+| `scrub_timeline` | Jump to a frame and get the evaluated object states |
 | `get_scene_info` | Quick scene overview (object count, materials) |
 | `get_object_info` | Detailed info for a single object (incl. constraints, modifiers) |
 | `get_viewport_screenshot` | Capture the 3D viewport |
@@ -88,7 +100,7 @@ In Claude Code, ask Claude to run `get_scene_info` — if it returns your scene 
 
 ## Roadmap
 
-- **Animation workflow** — Keyframe insertion, timeline scrubbing, animation preview rendering, NLA strip management
+- **Animation workflow** — Animation preview rendering, NLA strip management
 - **Scientific visualization** — Magnetic fields, force fields, particle systems, fluid simulations, rigid body dynamics
 - **Cowork integration** — Multi-user collaborative sessions with shared scene state
 

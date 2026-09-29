@@ -828,7 +828,7 @@ def plot_vector_field(ctx: Context, name: str, field: List[str], bounds: List[Li
                       thickness: float = 0.02, color_scale: str = "auto",
                       seeds: List[List[float]] = None, seed_resolution: List[int] = None,
                       step_size: float = None, max_steps: int = 500,
-                      streamline_color: List[float] = [0.9, 0.9, 0.9]) -> str:
+                      streamline_color: List[float] = [0.7, 0.7, 0.72]) -> str:
     """
     Visualize a vector field F(x, y, z) as colored arrows and/or streamlines (field lines).
     Re-running with the same name replaces the previous objects, for quick iteration.
@@ -849,7 +849,8 @@ def plot_vector_field(ctx: Context, name: str, field: List[str], bounds: List[Li
     - arrow_scale: Arrow length relative to the grid spacing
     - thickness: Arrow shaft / streamline radius
     - color_scale: "linear", "log" or "auto" (log if magnitudes span more than 100x)
-    - seeds: Start points for streamlines. Default: a grid of half the arrow resolution.
+    - seeds: Start points for streamlines. Default: a grid of about a quarter of the arrow
+      resolution per axis (at least 2), so arrows stay visible between the lines.
     - seed_resolution: Seed grid [nx, ny, nz] if no seeds are given
     - step_size: Integration step along the field line (default: 0.1 x grid spacing)
     - max_steps: Maximum steps per direction for each streamline

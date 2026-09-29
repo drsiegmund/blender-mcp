@@ -1927,7 +1927,8 @@ class BlenderMCPServer:
         bpy.context.scene.collection.objects.link(obj)
         return obj
 
-    def _build_polyline_curve(self, name, polylines, thickness, materials=None, material_indices=None):
+    def _build_polyline_curve(self, name, polylines, thickness, materials=None, material_indices=None,
+                              radii=None):
         import numpy as np
         curve = bpy.data.curves.new(name, 'CURVE')
         curve.dimensions = '3D'
@@ -1942,6 +1943,8 @@ class BlenderMCPServer:
             spline.points.add(len(line) - 1)
             co = np.column_stack([line, np.ones(len(line))]).astype(np.float32)
             spline.points.foreach_set("co", co.ravel())
+            if radii is not None:
+                spline.points.foreach_set("radius", np.full(len(line), radii[i], dtype=np.float32))
             if material_indices is not None:
                 spline.material_index = material_indices[i]
         obj = bpy.data.objects.new(name, curve)
@@ -1999,7 +2002,7 @@ class BlenderMCPServer:
                           mode="arrows", normalize=True, arrow_scale=0.8, thickness=0.02,
                           color_scale="auto",
                           seeds=None, seed_resolution=None, step_size=None, max_steps=500,
-                          streamline_color=(0.9, 0.9, 0.9)):
+                          streamline_color=(0.7, 0.7, 0.72)):
         """Visualize a vector field F(x, y, z) as colored arrows and/or streamlines."""
         import numpy as np
         if mode not in ("arrows", "streamlines", "both"):
@@ -2043,7 +2046,8 @@ class BlenderMCPServer:
             if seeds is not None:
                 seed_pts = np.array(seeds, dtype=float).reshape(-1, 3)
             else:
-                seed_res = seed_resolution or [max(2, n // 2) if n > 1 else 1 for n in res]
+                # About a quarter of the arrow resolution keeps the arrows visible between lines
+                seed_res = seed_resolution or [max(2, n // 4) if n > 1 else 1 for n in res]
                 seed_axes = [np.linspace(lo, hi, n + 2)[1:-1] if n > 1 else np.array([(lo + hi) / 2])
                              for (lo, hi), n in zip(bounds, seed_res)]
                 seed_pts = np.stack(np.meshgrid(*seed_axes, indexing="ij"), axis=-1).reshape(-1, 3)
@@ -2057,7 +2061,7 @@ class BlenderMCPServer:
             stream_name = f"{name}_streamlines"
             self._replace_object(stream_name)
             mat = self._solid_material(f"{stream_name}_mat", streamline_color)
-            obj = self._build_polyline_curve(stream_name, lines, thickness * 0.75, [mat])
+            obj = self._build_polyline_curve(stream_name, lines, thickness * 0.5, [mat])
             result["objects"].append(obj.name)
             result["streamlines"] = len(lines)
             result["streamline_points"] = int(sum(len(l) for l in lines))
@@ -2132,7 +2136,10 @@ class BlenderMCPServer:
         colors = [color] * n if color else [self._colormap(i / max(n - 1, 1)) for i in range(n)]
         mats = [self._solid_material(f"{name}_mat_{i}", c, emission=0.3) for i, c in enumerate(colors)]
         self._replace_object(name)
-        obj = self._build_polyline_curve(name, cleaned, thickness, mats, list(range(n)))
+        # Slightly thinner tubes for later trajectories: where trajectories coincide, the
+        # outer tube shows one clean color instead of z-fighting stripes
+        radii = [1.0 - 0.15 * i / max(n - 1, 1) for i in range(n)]
+        obj = self._build_polyline_curve(name, cleaned, thickness, mats, list(range(n)), radii)
 
         result = {"name": name, "source": source, "trajectories": n,
                   "points_per_trajectory": [len(l) for l in cleaned],

@@ -128,3 +128,14 @@ def test_animated_trajectory(server, scene):
 def test_trajectory_errors(server, kwargs, message):
     with pytest.raises(ValueError, match=message):
         server.plot_trajectory("Bad", **kwargs)
+
+
+def test_default_seeds_are_sparser_than_arrows(server):
+    r = server.plot_vector_field("Rot", ROTATION, PLANE, resolution=[17, 17, 1], mode="both")
+    assert r["streamlines"] <= 16 < r["arrows"]
+
+
+def test_later_trajectories_are_thinner(server):
+    server.plot_trajectory("Two", points=[[[0, 0, 0], [1, 0, 0]], [[0, 0, 0], [1, 0, 0]]])
+    radii = [s.points[0].radius for s in bpy.data.objects["Two"].data.splines]
+    assert radii[0] == pytest.approx(1.0) and radii[1] == pytest.approx(0.85)

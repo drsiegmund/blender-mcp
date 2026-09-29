@@ -32,6 +32,18 @@ wm = bpy.context.window_manager
 old = bpy.data.scenes.get("MCP_Live_Test")
 if old:
     bpy.data.scenes.remove(old)
+# Remove leftovers of earlier runs: removing a scene orphans its objects, and a new
+# "LiveCube" would otherwise become "LiveCube.001" while the tests address the orphan
+for name in ("LiveCube", "LiveCam", "LiveSun", "Dipole", "Dipole_streamlines", "Lorenz",
+             "Lorenz_marker_0", "Lorenz_marker_1"):
+    obj = bpy.data.objects.get(name)
+    if obj:
+        bpy.data.objects.remove(obj, do_unlink=True)
+for collection in (bpy.data.meshes, bpy.data.cameras, bpy.data.lights, bpy.data.curves,
+                   bpy.data.actions, bpy.data.worlds):
+    for block in list(collection):
+        if block.name.startswith(("Live", "Dipole", "Lorenz")) and block.users == 0:
+            collection.remove(block)
 sc = bpy.data.scenes.new("MCP_Live_Test")
 for win in wm.windows:
     win.scene = sc
@@ -43,6 +55,8 @@ cam.location = (0, -12, 3); cam.rotation_euler = (1.35, 0, 0); sc.camera = cam
 sun = bpy.data.objects.new("LiveSun", bpy.data.lights.new("LiveSun", "SUN")); sc.collection.objects.link(sun)
 sun.rotation_euler = (0.7, 0.2, 0.6); sun.data.energy = 3
 sc.world = bpy.data.worlds.new("LiveWorld"); sc.world.color = (0.05, 0.05, 0.06)
+names = sorted(o.name for o in sc.objects)
+assert names == ["LiveCam", "LiveCube", "LiveSun"], f"unexpected object names {names}"
 print(bpy.app.version_string, "|", bpy.context.scene.name)
 '''
 

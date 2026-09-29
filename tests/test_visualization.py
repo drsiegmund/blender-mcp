@@ -139,3 +139,31 @@ def test_later_trajectories_are_thinner(server):
     server.plot_trajectory("Two", points=[[[0, 0, 0], [1, 0, 0]], [[0, 0, 0], [1, 0, 0]]])
     radii = [s.points[0].radius for s in bpy.data.objects["Two"].data.splines]
     assert radii[0] == pytest.approx(1.0) and radii[1] == pytest.approx(0.85)
+
+
+DIPOLE = ["3*x*z/(x**2+y**2+z**2)**2.5", "3*y*z/(x**2+y**2+z**2)**2.5",
+          "(3*z**2-(x**2+y**2+z**2))/(x**2+y**2+z**2)**2.5"]
+
+
+def test_circle_seeds_and_duplicate_removal(server):
+    r = server.plot_vector_field("Dip", DIPOLE, [[-2, 2], [0, 0], [-2, 2]], resolution=[9, 1, 9],
+                                 mode="streamlines", seed_radius=0.4, seed_count=16, step_size=0.02,
+                                 max_steps=800)
+    # Every closed dipole line crosses the seed circle twice, so about half are duplicates
+    assert r["duplicate_streamlines_removed"] >= 4
+    assert r["streamlines"] + r["duplicate_streamlines_removed"] == 16
+    for line in _curve_points("Dip_streamlines"):
+        assert np.allclose(line[:, 1], 0), "planar seeds stay in the xz-plane"
+
+
+def test_sphere_seeds(server):
+    seeds = server._seeds_around(np.zeros(3), 1.0, 20, np.array([[-1, 1], [-1, 1], [-1, 1]], float))
+    assert seeds.shape == (20, 3)
+    assert np.linalg.norm(seeds, axis=1) == pytest.approx(1.0)
+
+
+def test_replot_removes_orphaned_materials(server):
+    server.plot_vector_field("Rot", ROTATION, PLANE, resolution=[3, 3, 1], mode="both")
+    server.plot_vector_field("Rot", ROTATION, PLANE, resolution=[3, 3, 1], mode="both")
+    names = [m.name for m in bpy.data.materials if m.name.startswith("Rot")]
+    assert sorted(names) == ["Rot_colormap", "Rot_streamlines_mat"]

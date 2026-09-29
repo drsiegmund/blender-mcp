@@ -84,6 +84,7 @@ Snapshots and diffs now capture object constraints (Track To, Follow Path, Copy 
 | `remove_nla` | Remove an NLA strip or track |
 | `plot_vector_field` | Vector field as colored arrows and/or streamlines |
 | `plot_trajectory` | Trajectories from points or an ODE (RK4), optionally animated |
+| `set_visibility` | Show or hide objects in renders and viewport |
 | `get_scene_info` | Quick scene overview (object count, materials) |
 | `get_object_info` | Detailed info for a single object (incl. constraints, modifiers) |
 | `get_viewport_screenshot` | Capture the 3D viewport |

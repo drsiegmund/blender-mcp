@@ -261,6 +261,7 @@ class BlenderMCPServer:
             "get_animation_data": self.get_animation_data,
             "set_timeline": self.set_timeline,
             "scrub_timeline": self.scrub_timeline,
+            "set_visibility": self.set_visibility,
             "push_action_to_nla": self.push_action_to_nla,
             "add_nla_strip": self.add_nla_strip,
             "update_nla_strip": self.update_nla_strip,
@@ -586,8 +587,10 @@ class BlenderMCPServer:
             "materials": {},
             "cameras": {},
             "lights": {},
+            "world": self._get_world_props(scene.world),
         }
 
+        used_materials = set()
         for obj in scene.objects:
             obj_data = {
                 "type": obj.type,
@@ -595,6 +598,7 @@ class BlenderMCPServer:
                 "rotation": self._round_vec(obj.rotation_euler),
                 "scale": self._round_vec(obj.scale),
                 "visible": obj.visible_get(),
+                "hide_render": obj.hide_render,
                 "parent": obj.parent.name if obj.parent else None,
                 "children": [c.name for c in obj.children],
                 "materials": [slot.material.name for slot in obj.material_slots if slot.material],
@@ -603,14 +607,19 @@ class BlenderMCPServer:
                 "modifiers": self._get_modifiers(obj),
             }
             snapshot["objects"][obj.name] = obj_data
+            used_materials.update(slot.material for slot in obj.material_slots if slot.material)
 
             if obj.type == 'CAMERA' and obj.data:
                 snapshot["cameras"][obj.name] = {
                     "location": self._round_vec(obj.location),
                     "rotation": self._round_vec(obj.rotation_euler),
+                    "type": obj.data.type,
                     "focal_length": round(float(obj.data.lens), 4),
+                    "ortho_scale": round(float(obj.data.ortho_scale), 4),
                     "sensor_width": round(float(obj.data.sensor_width), 4),
                     "sensor_height": round(float(obj.data.sensor_height), 4),
+                    "clip_start": round(float(obj.data.clip_start), 4),
+                    "clip_end": round(float(obj.data.clip_end), 4),
                 }
 
             if obj.type == 'LIGHT' and obj.data:
@@ -622,10 +631,39 @@ class BlenderMCPServer:
                     "energy": round(float(obj.data.energy), 4),
                 }
 
-        for mat in bpy.data.materials:
+        # Only materials used in this scene, not every material in the file
+        for mat in sorted(used_materials, key=lambda m: m.name):
             snapshot["materials"][mat.name] = self._get_material_props(mat)
 
         return snapshot
+
+    def _get_world_props(self, world):
+        if world is None:
+            return None
+        props = {"name": world.name, "color": self._round_vec(world.color), "background": None, "strength": None}
+        if world.node_tree:
+            bg = next((n for n in world.node_tree.nodes if n.type == 'BACKGROUND'), None)
+            if bg:
+                props["background"] = self._round_vec(bg.inputs["Color"].default_value)
+                props["strength"] = round(float(bg.inputs["Strength"].default_value), 4)
+        return props
+
+    # Snapshot property -> animated data path, to flag changes caused by animation
+    _ANIMATED_PATHS = {
+        "location": "location", "rotation": "rotation_euler", "scale": "scale",
+        "hide_render": "hide_render", "visible": "hide_viewport",
+        "focal_length": "data.lens", "ortho_scale": "data.ortho_scale",
+        "energy": "data.energy", "color": "data.color",
+    }
+
+    def _flag_animated(self, changes, keyframes):
+        """Mark changed properties that are animated (their value depends on the frame)."""
+        animated = 0
+        for prop, change in changes.items():
+            if self._ANIMATED_PATHS.get(prop) in keyframes:
+                change["animated"] = True
+                animated += 1
+        return animated == len(changes)
 
     def snapshot_scene(self):
         """Take a snapshot of the current scene and store it as baseline."""
@@ -676,11 +714,15 @@ class BlenderMCPServer:
             diff["added_objects"] = sorted(new_objs - old_objs)
             diff["removed_objects"] = sorted(old_objs - new_objs)
 
-            obj_props = ["location", "rotation", "scale", "visible", "parent", "materials", "constraints", "modifiers"]
+            obj_props = ["location", "rotation", "scale", "visible", "hide_render", "parent", "materials",
+                         "constraints", "modifiers"]
+            animation_only = 0
             for name in old_objs & new_objs:
                 changes = self._diff_dicts(old["objects"][name], current["objects"][name], obj_props)
                 if changes:
                     diff["modified_objects"][name] = changes
+                    if self._flag_animated(changes, current["objects"][name].get("keyframes", {})):
+                        animation_only += 1
 
             # Materials
             old_mats = set(old["materials"].keys())
@@ -695,11 +737,13 @@ class BlenderMCPServer:
                     diff["modified_materials"][name] = changes
 
             # Cameras
-            cam_props = ["location", "rotation", "focal_length", "sensor_width", "sensor_height"]
+            cam_props = ["location", "rotation", "type", "focal_length", "ortho_scale", "sensor_width",
+                         "sensor_height", "clip_start", "clip_end"]
             for name in set(old["cameras"].keys()) & set(current["cameras"].keys()):
                 changes = self._diff_dicts(old["cameras"][name], current["cameras"][name], cam_props)
                 if changes:
                     diff["camera_changes"][name] = changes
+                    self._flag_animated(changes, current["objects"].get(name, {}).get("keyframes", {}))
 
             # Lights
             light_props = ["location", "rotation", "light_type", "color", "energy"]
@@ -707,6 +751,16 @@ class BlenderMCPServer:
                 changes = self._diff_dicts(old["lights"][name], current["lights"][name], light_props)
                 if changes:
                     diff["light_changes"][name] = changes
+                    self._flag_animated(changes, current["objects"].get(name, {}).get("keyframes", {}))
+
+            # World
+            old_world, new_world = old.get("world"), current.get("world")
+            if old_world != new_world:
+                if old_world is None or new_world is None:
+                    diff["world_changes"] = {"world": {"old": old_world, "new": new_world}}
+                else:
+                    diff["world_changes"] = self._diff_dicts(old_world, new_world,
+                                                             ["name", "color", "background", "strength"])
 
             # Timeline
             timeline_props = ["frame_start", "frame_end", "fps"]
@@ -732,7 +786,8 @@ class BlenderMCPServer:
             if diff["removed_objects"]:
                 parts.append(f"{len(diff['removed_objects'])} removed")
             if diff["modified_objects"]:
-                parts.append(f"{len(diff['modified_objects'])} modified")
+                note = f" ({animation_only} only in animated properties)" if animation_only else ""
+                parts.append(f"{len(diff['modified_objects'])} modified{note}")
             if diff["added_materials"] or diff["removed_materials"] or diff["modified_materials"]:
                 mat_count = len(diff["added_materials"]) + len(diff["removed_materials"]) + len(diff["modified_materials"])
                 parts.append(f"{mat_count} material(s) changed")
@@ -740,6 +795,8 @@ class BlenderMCPServer:
                 parts.append("camera changed")
             if diff["light_changes"]:
                 parts.append("lights changed")
+            if diff.get("world_changes"):
+                parts.append("world changed")
             if diff["timeline_changes"]:
                 parts.append("timeline changed")
             if diff["keyframe_changes"]:
@@ -978,8 +1035,9 @@ class BlenderMCPServer:
         copy_path = os.path.join(self._history_dir(), f"render_{number:03d}.png")
         shutil.copyfile(filepath, copy_path)
         entry = dict(info, number=number, filepath=copy_path,
-                     time=datetime.now().isoformat(timespec="seconds"),
-                     frame=bpy.context.scene.frame_current)
+                     time=datetime.now().isoformat(timespec="seconds"))
+        if "frames" not in entry:  # previews list their frames; a still shows the current one
+            entry["frame"] = bpy.context.scene.frame_current
         self._render_history.append(entry)
         while len(self._render_history) > self._RENDER_HISTORY_SIZE:
             old = self._render_history.pop(0)
@@ -1065,6 +1123,9 @@ class BlenderMCPServer:
             "mean_difference": round(float(diff.mean()), 4),
             "max_difference": round(float(diff.max()), 4),
         }
+        if result["changed_fraction"] > 0.9:
+            result["note"] = ("Almost every pixel changed: framing, camera or background probably differ, "
+                              "so compare the panels visually rather than by the numbers.")
         if changed.any():
             rows, cols = np.nonzero(changed)
             # Image rows are stored bottom-up; report the box with a top-left origin
@@ -1573,9 +1634,10 @@ class BlenderMCPServer:
             scene.frame_set(int(frame_current))
         return self._get_timeline()
 
-    def scrub_timeline(self, frame, object_names=None):
+    def scrub_timeline(self, frame, object_names=None, restore_frame=False):
         """Jump to a frame and return the evaluated state of animated objects."""
         scene = bpy.context.scene
+        previous = (scene.frame_current, scene.frame_subframe)
         frame = float(frame)
         whole = int(frame // 1)
         scene.frame_set(whole, subframe=frame - whole)
@@ -1602,7 +1664,25 @@ class BlenderMCPServer:
                 state["color"] = self._round_vec(obj.data.color)
             states[obj.name] = state
 
-        return {"frame": frame, "timeline": self._get_timeline(), "objects": states}
+        timeline = self._get_timeline()
+        timeline["frame_subframe"] = round(float(scene.frame_subframe), 4)
+        if restore_frame:
+            scene.frame_set(previous[0], subframe=previous[1])
+            timeline["restored_to_frame"] = previous[0]
+        return {"frame": frame, "timeline": timeline, "objects": states}
+
+    def set_visibility(self, object_names, hide_render=None, hide_viewport=None):
+        """Show or hide objects in renders and/or the viewport."""
+        if not object_names:
+            raise ValueError("No object names given")
+        objects = [self._get_object(name) for name in object_names]
+        for obj in objects:
+            if hide_render is not None:
+                obj.hide_render = bool(hide_render)
+            if hide_viewport is not None:
+                obj.hide_viewport = bool(hide_viewport)
+        return {"objects": {o.name: {"hide_render": o.hide_render, "hide_viewport": o.hide_viewport}
+                            for o in objects}}
 
     # ---- NLA ----
 
@@ -1810,12 +1890,16 @@ class BlenderMCPServer:
         if not obj:
             return
         data = obj.data
+        materials = [m for m in getattr(data, "materials", []) if m is not None]
         bpy.data.objects.remove(obj, do_unlink=True)
         if data is not None and data.users == 0:
             if isinstance(data, bpy.types.Mesh):
                 bpy.data.meshes.remove(data)
             elif isinstance(data, bpy.types.Curve):
                 bpy.data.curves.remove(data)
+        for mat in materials:
+            if mat.users == 0:
+                bpy.data.materials.remove(mat)
 
     def _solid_material(self, name, color, emission=0.0):
         mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
@@ -1991,16 +2075,17 @@ class BlenderMCPServer:
                 alive[idx[~ok]] = False
             halves.append(paths)
 
-        lines = []
-        for fwd, bwd in zip(*halves):
+        lines, line_seeds = [], []
+        for seed, fwd, bwd in zip(seeds, *halves):
             line = np.array(bwd[::-1] + fwd[1:])
             if len(line) >= 2:
                 lines.append(line)
-        return lines
+                line_seeds.append(seed)
+        return lines, line_seeds
 
     def plot_vector_field(self, name, field, bounds, resolution=(10, 10, 1), params=None,
                           mode="arrows", normalize=True, arrow_scale=0.8, thickness=0.02,
-                          color_scale="auto",
+                          color_scale="auto", seed_center=None, seed_radius=None, seed_count=16,
                           seeds=None, seed_resolution=None, step_size=None, max_steps=500,
                           streamline_color=(0.7, 0.7, 0.72)):
         """Visualize a vector field F(x, y, z) as colored arrows and/or streamlines."""
@@ -2045,6 +2130,10 @@ class BlenderMCPServer:
         if mode in ("streamlines", "both"):
             if seeds is not None:
                 seed_pts = np.array(seeds, dtype=float).reshape(-1, 3)
+            elif seed_radius is not None:
+                seed_pts = self._seeds_around(np.array(seed_center if seed_center is not None else
+                                                       bounds.mean(axis=1), dtype=float),
+                                              float(seed_radius), int(seed_count), bounds)
             else:
                 # About a quarter of the arrow resolution keeps the arrows visible between lines
                 seed_res = seed_resolution or [max(2, n // 4) if n > 1 else 1 for n in res]
@@ -2055,17 +2144,55 @@ class BlenderMCPServer:
                 raise ValueError("At most 2000 streamline seeds are supported")
             h = step_size or spacing * 0.1
             # Keep flat fields flat: integrate within the degenerate axis range
-            lines = self._integrate_streamlines(f, seed_pts, bounds, h, int(max_steps))
+            lines, line_seeds = self._integrate_streamlines(f, seed_pts, bounds, h, int(max_steps))
             if not lines:
                 raise ValueError("No streamline could be traced from the seeds")
+            traced = len(lines)
+            lines = self._drop_duplicate_lines(lines, line_seeds, tolerance=3 * h)
             stream_name = f"{name}_streamlines"
             self._replace_object(stream_name)
             mat = self._solid_material(f"{stream_name}_mat", streamline_color)
             obj = self._build_polyline_curve(stream_name, lines, thickness * 0.5, [mat])
             result["objects"].append(obj.name)
             result["streamlines"] = len(lines)
+            if traced > len(lines):
+                result["duplicate_streamlines_removed"] = traced - len(lines)
             result["streamline_points"] = int(sum(len(l) for l in lines))
         return result
+
+    def _seeds_around(self, center, radius, count, bounds):
+        """Seeds on a circle (planar bounds: in the plane of the non-flat axes) or a sphere."""
+        import numpy as np
+        if radius <= 0 or count < 1:
+            raise ValueError("seed_radius must be > 0 and seed_count >= 1")
+        flat = [i for i in range(3) if bounds[i, 0] == bounds[i, 1]]
+        if len(flat) == 1:
+            a, b = [i for i in range(3) if i != flat[0]]
+            angles = np.linspace(0, 2 * np.pi, count, endpoint=False) + np.pi / count
+            pts = np.tile(center, (count, 1))
+            pts[:, a] += radius * np.cos(angles)
+            pts[:, b] += radius * np.sin(angles)
+            return pts
+        # Fibonacci sphere: evenly spread points
+        i = np.arange(count) + 0.5
+        polar = np.arccos(1 - 2 * i / count)
+        azimuth = np.pi * (1 + 5 ** 0.5) * i
+        return center + radius * np.column_stack([np.cos(azimuth) * np.sin(polar),
+                                                  np.sin(azimuth) * np.sin(polar), np.cos(polar)])
+
+    def _drop_duplicate_lines(self, lines, seeds, tolerance):
+        """Remove streamlines traced twice: two lines are the same field line when each
+        passes through the other's seed (e.g. a closed line crossing a seed circle twice)."""
+        import numpy as np
+
+        def passes(line, point):
+            return np.linalg.norm(line - point, axis=1).min() < tolerance
+
+        kept = []
+        for i, line in enumerate(lines):
+            if not any(passes(lines[j], seeds[i]) and passes(line, seeds[j]) for j in kept):
+                kept.append(i)
+        return [lines[i] for i in kept]
 
     def _integrate_ode(self, rhs, initial, t0, t1, steps):
         """Fixed-step RK4 for all initial conditions at once. Returns (steps+1, K, 3) and times."""

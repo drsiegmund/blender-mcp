@@ -65,3 +65,20 @@ def test_compare_needs_two_renders(server, render, tmp_path):
     render()
     with pytest.raises(ValueError, match="Only 1 render"):
         server.compare_renders(filepath=str(tmp_path / "cmp.png"))
+
+
+def test_render_history_frame_only_for_stills(server, render):
+    entry = render()
+    assert "frame" in entry
+    preview = server._remember_render(entry["filepath"], {"type": "animation_preview", "frames": [1, 5]})
+    assert "frame" not in preview and preview["frames"] == [1, 5]
+
+
+def test_compare_notes_framing_change(server, render, scene, tmp_path):
+    render()
+    background = next(n for n in scene.world.node_tree.nodes if n.type == 'BACKGROUND')
+    background.inputs["Color"].default_value = (0.9, 0.1, 0.1, 1.0)
+    background.inputs["Strength"].default_value = 5.0
+    render()
+    r = server.compare_renders(filepath=str(tmp_path / "cmp.png"))
+    assert r["changed_fraction"] > 0.9 and "note" in r

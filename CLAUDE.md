@@ -42,8 +42,8 @@ python -m pytest tests
 
 ### Scene Snapshot & Diff
 
-- **`snapshot_scene`** — Captures the complete scene state: all objects (position, rotation, scale, visibility, parenting, constraints, modifiers), materials (Principled BSDF properties), cameras, lights, keyframes, and timeline settings. Stored as baseline for later comparison.
-- **`diff_scene`** — Compares current scene against the last snapshot. Returns categorized changes: added/removed objects, modified properties, constraint and modifier changes, material changes, camera/light changes, timeline and keyframe changes. Does not update the baseline.
+- **`snapshot_scene`** — Captures the complete scene state: all objects (position, rotation, scale, visibility, render visibility, parenting, constraints, modifiers), the materials used in the scene (Principled BSDF properties), cameras (incl. type, ortho scale, clipping), lights, world background, keyframes, and timeline settings. Stored as baseline for later comparison.
+- **`diff_scene`** — Compares current scene against the last snapshot. Returns categorized changes: added/removed objects, modified properties, constraint and modifier changes, material changes, camera/light/world changes, timeline and keyframe changes. Changes of animated properties (e.g. after a frame change) are flagged with `"animated": true`. Does not update the baseline.
 
 ### Render Feedback Loop
 
@@ -52,7 +52,7 @@ python -m pytest tests
 - **`review_render`** — Returns the last render or a viewport screenshot together with scene metadata (object count, materials, lights, cameras, timeline). Designed for Claude Vision to analyze composition, lighting, and suggest improvements. Falls back to the result of the last async render if no render path is cached.
 
 - **`list_renders`** — Lists the render history: every finished `render_scene` and `render_animation_preview` is copied into a per-session history (last 20), numbered in order.
-- **`compare_renders`** — Shows two renders from the history as before | after | difference (changed pixels in red) and returns the changed fraction, mean/max difference and the bounding box of the change. Defaults compare the previous with the latest render. Different sizes are resampled.
+- **`compare_renders`** — Shows two renders from the history as before | after | difference (changed pixels in red) and returns the changed fraction, mean/max difference and the bounding box of the change. Defaults compare the previous with the latest render. Different sizes are resampled; a note warns when almost everything changed (framing or background).
 
 ### Depsgraph Change Detection
 
@@ -65,7 +65,8 @@ python -m pytest tests
 - **`delete_keyframes`** — Deletes keys by property, frame and/or vector component; removes fcurves that end up empty.
 - **`get_animation_data`** — Returns fcurves with frame, value and interpolation per key, assigned actions/slots, NLA tracks and drivers for one or all animated objects, plus the timeline.
 - **`set_timeline`** — Sets frame range, fps and current frame.
-- **`scrub_timeline`** — Jumps to a (fractional) frame and returns the evaluated world transforms (incl. parents and constraints), visibility, camera focal length and light energy of all objects that can move.
+- **`scrub_timeline`** — Jumps to a (fractional) frame and returns the evaluated world transforms (incl. parents and constraints), visibility, camera focal length and light energy of all objects that can move. `restore_frame=True` returns to the previous frame afterwards.
+- **`set_visibility`** — Shows or hides objects in renders and/or the viewport.
 
 - **`render_animation_preview`** — Renders up to 25 evenly spaced frames into one contact sheet (grid, each tile labeled with its frame number) so Claude Vision can judge motion at a glance. Async like `render_scene`: fetch the sheet with `poll_render_status`. Frames render one per timer tick, so polls report progress (`frames_done`/`frames_total`) between frames. Render settings and the current frame are restored afterwards.
 
@@ -83,10 +84,10 @@ Fcurve access is slot-aware and works with layered actions (Blender 4.4+/5.x) an
 
 ### Scientific Visualization
 
-- **`plot_vector_field`** — Visualizes F(x, y, z), given as three numpy expressions, as arrows (one mesh, colored by magnitude via a viridis ramp on a `magnitude` attribute; linear or log scale, auto-selected for large ranges) and/or streamlines (RK4 along the normalized field, traced both ways from seeds). Undefined samples (singularities) are skipped. Planar slices via equal min/max bounds.
+- **`plot_vector_field`** — Visualizes F(x, y, z), given as three numpy expressions, as arrows (one mesh, colored by magnitude via a viridis ramp on a `magnitude` attribute; linear or log scale, auto-selected for large ranges) and/or streamlines (RK4 along the normalized field, traced both ways from seeds on a grid, given points, or a circle/sphere around a source via `seed_radius`; lines traced twice are removed). Undefined samples (singularities) are skipped. Planar slices via equal min/max bounds.
 - **`plot_trajectory`** — Draws trajectories from points or solves dx/dt = F(x, y, z, t) with fixed-step RK4 for one or several initial conditions (each with its own color). Optional `fit_size` scaling and an animation that draws the curve in integration time with a glowing marker.
 
-Expressions are compiled with a whitelist of numpy functions (`sin`, `exp`, `sqrt`, `arctan2`, ...), the variables and user `params`; any other name is rejected before evaluation. Re-plotting with the same name replaces the objects, which fits the render feedback loop.
+Expressions are compiled with a whitelist of numpy functions (`sin`, `exp`, `sqrt`, `arctan2`, ...), the variables and user `params`; any other name is rejected before evaluation. Re-plotting with the same name replaces the objects and their orphaned materials, which fits the render feedback loop.
 
 ### Batch Script Execution
 

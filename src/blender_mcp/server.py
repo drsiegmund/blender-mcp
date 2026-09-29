@@ -681,20 +681,24 @@ def set_timeline(ctx: Context, frame_start: int = None, frame_end: int = None,
 
 @telemetry_tool("scrub_timeline")
 @mcp.tool()
-def scrub_timeline(ctx: Context, frame: float, object_names: List[str] = None) -> str:
+def scrub_timeline(ctx: Context, frame: float, object_names: List[str] = None,
+                   restore_frame: bool = False) -> str:
     """
     Jump to a frame and return the evaluated state of objects at that frame:
     world location/rotation/scale (including parents and constraints), visibility,
-    camera focal length and light energy/color. Leaves the scene at that frame.
+    camera focal length and light energy/color. Leaves the scene at that frame unless
+    restore_frame is true.
 
     Parameters:
     - frame: Frame to evaluate (fractional frames are supported, e.g. 12.5)
     - object_names: Objects to report. If omitted, all objects whose transform can
       change over time (animated, constrained, or with such a parent).
+    - restore_frame: Return to the previous frame afterwards, so later renders and
+      diff_scene are not affected (default: stay on the scrubbed frame, like the UI)
     """
     try:
         blender = get_blender_connection()
-        params = {"frame": frame}
+        params = {"frame": frame, "restore_frame": restore_frame}
         if object_names:
             params["object_names"] = object_names
         result = blender.send_command("scrub_timeline", params)
@@ -704,7 +708,7 @@ def scrub_timeline(ctx: Context, frame: float, object_names: List[str] = None) -
         return f"Error scrubbing timeline: {str(e)}"
 
 
-def _nla_command(command: str, params: Dict[str, Any], label: str) -> str:
+def _forward_command(command: str, params: Dict[str, Any], label: str) -> str:
     try:
         blender = get_blender_connection()
         result = blender.send_command(command, {k: v for k, v in params.items() if v is not None})
@@ -712,6 +716,23 @@ def _nla_command(command: str, params: Dict[str, Any], label: str) -> str:
     except Exception as e:
         logger.error(f"Error {label}: {str(e)}")
         return f"Error {label}: {str(e)}"
+
+
+@telemetry_tool("set_visibility")
+@mcp.tool()
+def set_visibility(ctx: Context, object_names: List[str], hide_render: bool = None,
+                   hide_viewport: bool = None) -> str:
+    """
+    Show or hide objects in renders and/or the viewport, e.g. to render one
+    visualization without the others. Only the given flags are changed.
+
+    Parameters:
+    - object_names: Objects to change
+    - hide_render: True hides the objects in renders, False shows them
+    - hide_viewport: True hides the objects in the viewport, False shows them
+    """
+    return _forward_command("set_visibility", {"object_names": object_names, "hide_render": hide_render,
+                        "hide_viewport": hide_viewport}, "setting visibility")
 
 
 @telemetry_tool("push_action_to_nla")
@@ -728,7 +749,7 @@ def push_action_to_nla(ctx: Context, object_name: str, target: str = "object",
     - track_name: Name for the new track (optional)
     - strip_name: Name for the strip (default: action name)
     """
-    return _nla_command("push_action_to_nla", {"object_name": object_name, "target": target,
+    return _forward_command("push_action_to_nla", {"object_name": object_name, "target": target,
                         "track_name": track_name, "strip_name": strip_name}, "pushing action to NLA")
 
 
@@ -755,7 +776,7 @@ def add_nla_strip(ctx: Context, object_name: str, action_name: str, frame_start:
     - extrapolation: HOLD, HOLD_FORWARD or NOTHING
     - blend_in / blend_out: Frames to fade the strip in/out
     """
-    return _nla_command("add_nla_strip", {
+    return _forward_command("add_nla_strip", {
         "object_name": object_name, "action_name": action_name, "frame_start": frame_start,
         "target": target, "track_name": track_name, "strip_name": strip_name, "repeat": repeat,
         "scale": scale, "blend_type": blend_type, "extrapolation": extrapolation,
@@ -778,7 +799,7 @@ def update_nla_strip(ctx: Context, object_name: str, track_name: str, strip_name
     - repeat, scale, blend_type, extrapolation, blend_in, blend_out: See add_nla_strip
     - mute: Mute or unmute the strip
     """
-    return _nla_command("update_nla_strip", {
+    return _forward_command("update_nla_strip", {
         "object_name": object_name, "track_name": track_name, "strip_name": strip_name,
         "target": target, "frame_start": frame_start, "repeat": repeat, "scale": scale,
         "blend_type": blend_type, "extrapolation": extrapolation, "blend_in": blend_in,
@@ -799,7 +820,7 @@ def set_nla_track(ctx: Context, object_name: str, track_name: str, target: str =
     - solo: Play only this track
     - name: New track name
     """
-    return _nla_command("set_nla_track", {"object_name": object_name, "track_name": track_name,
+    return _forward_command("set_nla_track", {"object_name": object_name, "track_name": track_name,
                         "target": target, "mute": mute, "solo": solo, "name": name}, "setting NLA track")
 
 
@@ -816,7 +837,7 @@ def remove_nla(ctx: Context, object_name: str, track_name: str, strip_name: str 
     - strip_name: Strip to remove (omit to remove the whole track)
     - target: "object" (default) or "data"
     """
-    return _nla_command("remove_nla", {"object_name": object_name, "track_name": track_name,
+    return _forward_command("remove_nla", {"object_name": object_name, "track_name": track_name,
                         "strip_name": strip_name, "target": target}, "removing NLA strip/track")
 
 
@@ -826,6 +847,7 @@ def plot_vector_field(ctx: Context, name: str, field: List[str], bounds: List[Li
                       resolution: List[int] = [10, 10, 1], params: Dict[str, float] = None,
                       mode: str = "arrows", normalize: bool = True, arrow_scale: float = 0.8,
                       thickness: float = 0.02, color_scale: str = "auto",
+                      seed_center: List[float] = None, seed_radius: float = None, seed_count: int = 16,
                       seeds: List[List[float]] = None, seed_resolution: List[int] = None,
                       step_size: float = None, max_steps: int = 500,
                       streamline_color: List[float] = [0.7, 0.7, 0.72]) -> str:
@@ -851,7 +873,10 @@ def plot_vector_field(ctx: Context, name: str, field: List[str], bounds: List[Li
     - color_scale: "linear", "log" or "auto" (log if magnitudes span more than 100x)
     - seeds: Start points for streamlines. Default: a grid of about a quarter of the arrow
       resolution per axis (at least 2), so arrows stay visible between the lines.
-    - seed_resolution: Seed grid [nx, ny, nz] if no seeds are given
+    - seed_center / seed_radius / seed_count: Seeds on a circle (planar bounds) or sphere
+      around seed_center (default: center of bounds). Best for sources such as a dipole:
+      e.g. seed_radius=0.4, seed_count=16. Streamlines traced twice are removed.
+    - seed_resolution: Seed grid [nx, ny, nz] if neither seeds nor seed_radius are given
     - step_size: Integration step along the field line (default: 0.1 x grid spacing)
     - max_steps: Maximum steps per direction for each streamline
     - streamline_color: RGB color of the streamlines
@@ -864,9 +889,11 @@ def plot_vector_field(ctx: Context, name: str, field: List[str], bounds: List[Li
         params_dict = {"name": name, "field": field, "bounds": bounds, "resolution": resolution,
                        "mode": mode, "normalize": normalize, "arrow_scale": arrow_scale,
                        "thickness": thickness, "color_scale": color_scale, "max_steps": max_steps,
+                       "seed_count": seed_count,
                        "streamline_color": streamline_color}
         for key, value in {"params": params, "seeds": seeds, "seed_resolution": seed_resolution,
-                           "step_size": step_size}.items():
+                           "step_size": step_size, "seed_center": seed_center,
+                           "seed_radius": seed_radius}.items():
             if value is not None:
                 params_dict[key] = value
         result = blender.send_command("plot_vector_field", params_dict)

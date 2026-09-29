@@ -112,3 +112,20 @@ def test_delete_all_keyframes_including_data(server):
     server.insert_keyframes("Light", "data.energy", [{"frame": 1, "value": 10}, {"frame": 5, "value": 20}])
     r = server.delete_keyframes("Light")
     assert r["removed"] == {"data.energy[0]": 2}
+
+
+def test_scrub_restore_frame_and_subframe(cube_animation, scene):
+    scene.frame_set(5)
+    r = cube_animation.scrub_timeline(20.5, restore_frame=True)
+    assert r["timeline"]["frame_subframe"] == pytest.approx(0.5)
+    assert r["timeline"]["restored_to_frame"] == 5
+    assert scene.frame_current == 5
+    assert bpy.data.objects["Cube"].location.x == pytest.approx(-3 + 6 * 4 / 39)
+
+
+def test_set_visibility(server):
+    r = server.set_visibility(["Cube", "Light"], hide_render=True)
+    assert r["objects"]["Cube"] == {"hide_render": True, "hide_viewport": False}
+    assert bpy.data.objects["Light"].hide_render
+    with pytest.raises(ValueError, match="Object not found"):
+        server.set_visibility(["Nope"], hide_render=True)

@@ -21,3 +21,7 @@ src/blender_mcp/config.py
 # Blender files
 *.blend
 *.blend1
+
+# Test environments
+.venv-test/
+.pytest_cache/

@@ -486,6 +486,46 @@ def poll_render_status(ctx: Context) -> list:
         return [f"Error polling render status: {str(e)}"]
 
 
+@telemetry_tool("render_animation_preview")
+@mcp.tool()
+def render_animation_preview(ctx: Context, frame_start: int = None, frame_end: int = None,
+                             num_frames: int = 9, columns: int = None,
+                             resolution_x: int = 480, resolution_y: int = 270,
+                             engine: str = "EEVEE", samples: int = None) -> str:
+    """
+    Start rendering evenly spaced frames of the animation into one contact sheet
+    (grid image, each tile labeled with its frame number) for reviewing motion at a glance.
+    Returns immediately; call poll_render_status to see progress (frames_done/frames_total)
+    and to get the contact sheet when complete. review_render also shows it afterwards.
+    Frames are rendered one per Blender timer tick, so polls are answered between frames.
+
+    Parameters:
+    - frame_start: First frame (default: scene start)
+    - frame_end: Last frame (default: scene end)
+    - num_frames: Number of frames to sample, 1-25 (default: 9)
+    - columns: Grid columns (default: square-ish grid)
+    - resolution_x / resolution_y: Size of each tile in pixels (default: 480x270)
+    - engine: "EEVEE" or "CYCLES" (default: "EEVEE")
+    - samples: Render samples per frame (default: 32 for EEVEE, 64 for Cycles)
+    """
+    try:
+        blender = get_blender_connection()
+        temp_path = os.path.join(tempfile.gettempdir(), f"blender_preview_{os.getpid()}.png")
+        params = {"filepath": temp_path, "num_frames": num_frames,
+                  "resolution_x": resolution_x, "resolution_y": resolution_y, "engine": engine}
+        for key, value in {"frame_start": frame_start, "frame_end": frame_end,
+                           "columns": columns, "samples": samples}.items():
+            if value is not None:
+                params[key] = value
+        result = blender.send_command("render_animation_preview", params, timeout=30)
+        if "error" in result:
+            raise Exception(result["error"])
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error starting animation preview: {str(e)}")
+        return f"Error starting animation preview: {str(e)}"
+
+
 @telemetry_tool("execute_batch_script")
 @mcp.tool()
 def execute_batch_script(ctx: Context, code: str = "") -> str:
@@ -526,6 +566,436 @@ def poll_batch_status(ctx: Context) -> str:
     except Exception as e:
         logger.error(f"Error polling batch status: {str(e)}")
         return f"Error polling batch status: {str(e)}"
+
+
+@telemetry_tool("insert_keyframes")
+@mcp.tool()
+def insert_keyframes(ctx: Context, object_name: str, data_path: str, keyframes: List[Dict[str, Any]],
+                     index: int = -1, interpolation: str = None) -> str:
+    """
+    Insert keyframes on an object property.
+
+    Parameters:
+    - object_name: Name of the object to animate
+    - data_path: RNA path of the property, e.g. "location", "rotation_euler", "scale",
+      "hide_render", 'modifiers["Array"].count', '["my_prop"]'. Prefix with "data." to
+      animate the object's data block, e.g. "data.energy" (light), "data.lens" (camera).
+    - keyframes: List of {"frame": number, "value": optional, "interpolation": optional}.
+      "value" is a list for vector properties (index=-1) or a number for a single
+      component (index>=0) or scalar property. Without "value" the current value is keyed.
+    - index: Vector component to key (0=X, 1=Y, 2=Z), or -1 for all components (default)
+    - interpolation: Default interpolation for the new keys: CONSTANT, LINEAR, BEZIER,
+      SINE, QUAD, CUBIC, QUART, QUINT, EXPO, CIRC, BACK, BOUNCE, ELASTIC
+
+    Returns the resulting fcurves with all keyframes of the property.
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"object_name": object_name, "data_path": data_path,
+                  "keyframes": keyframes, "index": index}
+        if interpolation:
+            params["interpolation"] = interpolation
+        result = blender.send_command("insert_keyframes", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error inserting keyframes: {str(e)}")
+        return f"Error inserting keyframes: {str(e)}"
+
+
+@telemetry_tool("delete_keyframes")
+@mcp.tool()
+def delete_keyframes(ctx: Context, object_name: str, data_path: str = None,
+                     frames: List[float] = None, index: int = -1) -> str:
+    """
+    Delete keyframes from an object. Empty fcurves are removed.
+
+    Parameters:
+    - object_name: Name of the object
+    - data_path: Property to delete keys from (same format as insert_keyframes).
+      If omitted, all animated properties of the object and its data are affected.
+    - frames: Frames to delete keys at. If omitted, all keys are deleted.
+    - index: Vector component (0=X, 1=Y, 2=Z), or -1 for all components (default)
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"object_name": object_name, "index": index}
+        if data_path:
+            params["data_path"] = data_path
+        if frames is not None:
+            params["frames"] = frames
+        result = blender.send_command("delete_keyframes", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error deleting keyframes: {str(e)}")
+        return f"Error deleting keyframes: {str(e)}"
+
+
+@telemetry_tool("get_animation_data")
+@mcp.tool()
+def get_animation_data(ctx: Context, object_name: str = None, max_keyframes: int = 100) -> str:
+    """
+    Get detailed animation data: fcurves with keyframe frames, values and
+    interpolation, assigned actions, NLA tracks and drivers, plus the timeline.
+    Covers the object and its data block (light energy, camera lens, ...).
+
+    Parameters:
+    - object_name: Object to inspect. If omitted, all animated objects in the scene.
+    - max_keyframes: Maximum keyframes listed per fcurve (default: 100)
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"max_keyframes": max_keyframes}
+        if object_name:
+            params["object_name"] = object_name
+        result = blender.send_command("get_animation_data", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting animation data: {str(e)}")
+        return f"Error getting animation data: {str(e)}"
+
+
+@telemetry_tool("set_timeline")
+@mcp.tool()
+def set_timeline(ctx: Context, frame_start: int = None, frame_end: int = None,
+                 fps: int = None, frame_current: int = None) -> str:
+    """
+    Set the scene timeline. Only the given values are changed.
+
+    Parameters:
+    - frame_start: First frame of the animation range
+    - frame_end: Last frame of the animation range
+    - fps: Frame rate (sets fps_base to 1.0)
+    - frame_current: Frame to jump to
+    """
+    try:
+        blender = get_blender_connection()
+        params = {k: v for k, v in {"frame_start": frame_start, "frame_end": frame_end,
+                                    "fps": fps, "frame_current": frame_current}.items()
+                  if v is not None}
+        result = blender.send_command("set_timeline", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting timeline: {str(e)}")
+        return f"Error setting timeline: {str(e)}"
+
+
+@telemetry_tool("scrub_timeline")
+@mcp.tool()
+def scrub_timeline(ctx: Context, frame: float, object_names: List[str] = None,
+                   restore_frame: bool = False) -> str:
+    """
+    Jump to a frame and return the evaluated state of objects at that frame:
+    world location/rotation/scale (including parents and constraints), visibility,
+    camera focal length and light energy/color. Leaves the scene at that frame unless
+    restore_frame is true.
+
+    Parameters:
+    - frame: Frame to evaluate (fractional frames are supported, e.g. 12.5)
+    - object_names: Objects to report. If omitted, all objects whose transform can
+      change over time (animated, constrained, or with such a parent).
+    - restore_frame: Return to the previous frame afterwards, so later renders and
+      diff_scene are not affected (default: stay on the scrubbed frame, like the UI)
+    """
+    try:
+        blender = get_blender_connection()
+        params = {"frame": frame, "restore_frame": restore_frame}
+        if object_names:
+            params["object_names"] = object_names
+        result = blender.send_command("scrub_timeline", params)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error scrubbing timeline: {str(e)}")
+        return f"Error scrubbing timeline: {str(e)}"
+
+
+def _forward_command(command: str, params: Dict[str, Any], label: str) -> str:
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command(command, {k: v for k, v in params.items() if v is not None})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error {label}: {str(e)}")
+        return f"Error {label}: {str(e)}"
+
+
+@telemetry_tool("set_visibility")
+@mcp.tool()
+def set_visibility(ctx: Context, object_names: List[str], hide_render: bool = None,
+                   hide_viewport: bool = None) -> str:
+    """
+    Show or hide objects in renders and/or the viewport, e.g. to render one
+    visualization without the others. Only the given flags are changed.
+
+    Parameters:
+    - object_names: Objects to change
+    - hide_render: True hides the objects in renders, False shows them
+    - hide_viewport: True hides the objects in the viewport, False shows them
+    """
+    return _forward_command("set_visibility", {"object_names": object_names, "hide_render": hide_render,
+                        "hide_viewport": hide_viewport}, "setting visibility")
+
+
+@telemetry_tool("push_action_to_nla")
+@mcp.tool()
+def push_action_to_nla(ctx: Context, object_name: str, target: str = "object",
+                       track_name: str = None, strip_name: str = None) -> str:
+    """
+    Push the active action of an object down into a new NLA track (like "Push Down"
+    in Blender). The action keeps animating as a strip and the object is free for a new action.
+
+    Parameters:
+    - object_name: Name of the object
+    - target: "object" (default) or "data" for the data block's action (light, camera, ...)
+    - track_name: Name for the new track (optional)
+    - strip_name: Name for the strip (default: action name)
+    """
+    return _forward_command("push_action_to_nla", {"object_name": object_name, "target": target,
+                        "track_name": track_name, "strip_name": strip_name}, "pushing action to NLA")
+
+
+@telemetry_tool("add_nla_strip")
+@mcp.tool()
+def add_nla_strip(ctx: Context, object_name: str, action_name: str, frame_start: int,
+                  target: str = "object", track_name: str = None, strip_name: str = None,
+                  repeat: float = None, scale: float = None, blend_type: str = None,
+                  extrapolation: str = None, blend_in: float = None, blend_out: float = None) -> str:
+    """
+    Place an existing action as a strip in the NLA, e.g. to reuse a walk cycle or
+    sequence several actions. Fails if the strip would overlap another strip on the track.
+
+    Parameters:
+    - object_name: Name of the object
+    - action_name: Name of the action (see get_animation_data for existing actions)
+    - frame_start: Frame where the strip starts
+    - target: "object" (default) or "data"
+    - track_name: Existing track to use; a new track is created if missing or omitted
+    - strip_name: Strip name (default: action name)
+    - repeat: Number of repetitions of the action
+    - scale: Time scale (2.0 = half speed)
+    - blend_type: REPLACE, COMBINE, ADD, SUBTRACT or MULTIPLY
+    - extrapolation: HOLD, HOLD_FORWARD or NOTHING
+    - blend_in / blend_out: Frames to fade the strip in/out
+    """
+    return _forward_command("add_nla_strip", {
+        "object_name": object_name, "action_name": action_name, "frame_start": frame_start,
+        "target": target, "track_name": track_name, "strip_name": strip_name, "repeat": repeat,
+        "scale": scale, "blend_type": blend_type, "extrapolation": extrapolation,
+        "blend_in": blend_in, "blend_out": blend_out}, "adding NLA strip")
+
+
+@telemetry_tool("update_nla_strip")
+@mcp.tool()
+def update_nla_strip(ctx: Context, object_name: str, track_name: str, strip_name: str,
+                     target: str = "object", frame_start: float = None, repeat: float = None,
+                     scale: float = None, blend_type: str = None, extrapolation: str = None,
+                     blend_in: float = None, blend_out: float = None, mute: bool = None) -> str:
+    """
+    Move or change an NLA strip. Only the given values are changed.
+
+    Parameters:
+    - object_name, track_name, strip_name: Identify the strip
+    - target: "object" (default) or "data"
+    - frame_start: New start frame (moves the strip, keeps its length)
+    - repeat, scale, blend_type, extrapolation, blend_in, blend_out: See add_nla_strip
+    - mute: Mute or unmute the strip
+    """
+    return _forward_command("update_nla_strip", {
+        "object_name": object_name, "track_name": track_name, "strip_name": strip_name,
+        "target": target, "frame_start": frame_start, "repeat": repeat, "scale": scale,
+        "blend_type": blend_type, "extrapolation": extrapolation, "blend_in": blend_in,
+        "blend_out": blend_out, "mute": mute}, "updating NLA strip")
+
+
+@telemetry_tool("set_nla_track")
+@mcp.tool()
+def set_nla_track(ctx: Context, object_name: str, track_name: str, target: str = "object",
+                  mute: bool = None, solo: bool = None, name: str = None) -> str:
+    """
+    Mute, solo or rename an NLA track.
+
+    Parameters:
+    - object_name, track_name: Identify the track
+    - target: "object" (default) or "data"
+    - mute: Mute or unmute the whole track
+    - solo: Play only this track
+    - name: New track name
+    """
+    return _forward_command("set_nla_track", {"object_name": object_name, "track_name": track_name,
+                        "target": target, "mute": mute, "solo": solo, "name": name}, "setting NLA track")
+
+
+@telemetry_tool("remove_nla")
+@mcp.tool()
+def remove_nla(ctx: Context, object_name: str, track_name: str, strip_name: str = None,
+               target: str = "object") -> str:
+    """
+    Remove an NLA strip, or the whole track if strip_name is omitted.
+    The action itself is kept in the file.
+
+    Parameters:
+    - object_name, track_name: Identify the track
+    - strip_name: Strip to remove (omit to remove the whole track)
+    - target: "object" (default) or "data"
+    """
+    return _forward_command("remove_nla", {"object_name": object_name, "track_name": track_name,
+                        "strip_name": strip_name, "target": target}, "removing NLA strip/track")
+
+
+@telemetry_tool("plot_vector_field")
+@mcp.tool()
+def plot_vector_field(ctx: Context, name: str, field: List[str], bounds: List[List[float]],
+                      resolution: List[int] = [10, 10, 1], params: Dict[str, float] = None,
+                      mode: str = "arrows", normalize: bool = True, arrow_scale: float = 0.8,
+                      thickness: float = 0.02, color_scale: str = "auto",
+                      seed_center: List[float] = None, seed_radius: float = None, seed_count: int = 16,
+                      seeds: List[List[float]] = None, seed_resolution: List[int] = None,
+                      step_size: float = None, max_steps: int = 500,
+                      streamline_color: List[float] = [0.7, 0.7, 0.72]) -> str:
+    """
+    Visualize a vector field F(x, y, z) as colored arrows and/or streamlines (field lines).
+    Re-running with the same name replaces the previous objects, for quick iteration.
+
+    Parameters:
+    - name: Object name. Arrows are created as <name>, streamlines as <name>_streamlines.
+    - field: Three numpy expressions for Fx, Fy, Fz in x, y, z, e.g. ["-y", "x", "0"].
+      Functions: sin, cos, tan, arcsin, arccos, arctan, arctan2, sinh, cosh, tanh, exp,
+      log, log10, sqrt, abs, sign, minimum, maximum, where, hypot, floor, ceil; constants pi, e.
+      Magnetic dipole along z: ["3*x*z/(x**2+y**2+z**2)**2.5", "3*y*z/(x**2+y**2+z**2)**2.5",
+      "(3*z**2-(x**2+y**2+z**2))/(x**2+y**2+z**2)**2.5"]
+    - bounds: [[xmin, xmax], [ymin, ymax], [zmin, zmax]]; use equal min/max for a planar slice
+    - resolution: Samples per axis [nx, ny, nz] (at most 20000 in total)
+    - params: Named constants usable in the expressions, e.g. {"k": 2.0}
+    - mode: "arrows", "streamlines" or "both"
+    - normalize: Equal arrow length (magnitude shown by color only). Recommended for fields
+      with singularities. If false, length is proportional to magnitude.
+    - arrow_scale: Arrow length relative to the grid spacing
+    - thickness: Arrow shaft / streamline radius
+    - color_scale: "linear", "log" or "auto" (log if magnitudes span more than 100x)
+    - seeds: Start points for streamlines. Default: a grid of about a quarter of the arrow
+      resolution per axis (at least 2), so arrows stay visible between the lines.
+    - seed_center / seed_radius / seed_count: Seeds on a circle (planar bounds) or sphere
+      around seed_center (default: center of bounds). Best for sources such as a dipole:
+      e.g. seed_radius=0.4, seed_count=16. Streamlines traced twice are removed.
+    - seed_resolution: Seed grid [nx, ny, nz] if neither seeds nor seed_radius are given
+    - step_size: Integration step along the field line (default: 0.1 x grid spacing)
+    - max_steps: Maximum steps per direction for each streamline
+    - streamline_color: RGB color of the streamlines
+
+    Samples where the field is undefined (e.g. singularities) are skipped. Returns object
+    names, arrow count, magnitude range and streamline statistics.
+    """
+    try:
+        blender = get_blender_connection()
+        params_dict = {"name": name, "field": field, "bounds": bounds, "resolution": resolution,
+                       "mode": mode, "normalize": normalize, "arrow_scale": arrow_scale,
+                       "thickness": thickness, "color_scale": color_scale, "max_steps": max_steps,
+                       "seed_count": seed_count,
+                       "streamline_color": streamline_color}
+        for key, value in {"params": params, "seeds": seeds, "seed_resolution": seed_resolution,
+                           "step_size": step_size, "seed_center": seed_center,
+                           "seed_radius": seed_radius}.items():
+            if value is not None:
+                params_dict[key] = value
+        result = blender.send_command("plot_vector_field", params_dict)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error plotting vector field: {str(e)}")
+        return f"Error plotting vector field: {str(e)}"
+
+
+@telemetry_tool("plot_trajectory")
+@mcp.tool()
+def plot_trajectory(ctx: Context, name: str, points: List[Any] = None, ode: List[str] = None,
+                    initial: List[Any] = None, t_span: List[float] = [0.0, 10.0], steps: int = 2000,
+                    params: Dict[str, float] = None, thickness: float = 0.03,
+                    color: List[float] = None, fit_size: float = None, animate: bool = False,
+                    frame_start: int = None, frame_end: int = None, marker_size: float = None) -> str:
+    """
+    Draw one or more trajectories as tube curves, either from given points or by solving
+    the ODE dx/dt = F(x, y, z, t) with fixed-step RK4. Re-running with the same name
+    replaces the previous curve.
+
+    Parameters:
+    - name: Object name of the curve
+    - points: A list of [x, y, z] points, or a list of such lists for several trajectories
+    - ode: Three numpy expressions for dx/dt, dy/dt, dz/dt in x, y, z, t (same functions as
+      plot_vector_field), e.g. Lorenz: ["sigma*(y-x)", "x*(rho-z)-y", "x*y-beta*z"]
+    - initial: Initial condition [x0, y0, z0], or a list of them to compare trajectories
+    - t_span: [t0, t1] integration interval
+    - steps: Number of RK4 steps (the curve gets steps+1 points)
+    - params: Named constants for the expressions, e.g. {"sigma": 10, "rho": 28, "beta": 2.667}
+    - thickness: Tube radius
+    - color: RGB color for all trajectories (default: viridis colors per trajectory)
+    - fit_size: Scale and center the result so its largest extent equals this size
+    - animate: Animate drawing the curve over time, with a glowing marker at the current
+      state. The drawing progress follows integration time, not arc length.
+    - frame_start / frame_end: Animation range (default: scene range)
+    - marker_size: Radius of the markers (default: 3 x thickness)
+
+    Trajectories are cut at the first non-finite value (blow-up). Returns point counts,
+    data bounds (before fitting) and the applied transform.
+    """
+    try:
+        blender = get_blender_connection()
+        params_dict = {"name": name, "t_span": t_span, "steps": steps, "thickness": thickness,
+                       "animate": animate}
+        for key, value in {"points": points, "ode": ode, "initial": initial, "params": params,
+                           "color": color, "fit_size": fit_size, "frame_start": frame_start,
+                           "frame_end": frame_end, "marker_size": marker_size}.items():
+            if value is not None:
+                params_dict[key] = value
+        result = blender.send_command("plot_trajectory", params_dict)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error plotting trajectory: {str(e)}")
+        return f"Error plotting trajectory: {str(e)}"
+
+
+@telemetry_tool("list_renders")
+@mcp.tool()
+def list_renders(ctx: Context) -> str:
+    """
+    List the render history: the last 20 finished renders and animation previews,
+    numbered in order, with type, engine, size, frame and time. Use the numbers
+    (or negative indices, -1 = latest) with compare_renders.
+    """
+    try:
+        blender = get_blender_connection()
+        return json.dumps(blender.send_command("list_renders"), indent=2)
+    except Exception as e:
+        logger.error(f"Error listing renders: {str(e)}")
+        return f"Error listing renders: {str(e)}"
+
+
+@telemetry_tool("compare_renders")
+@mcp.tool()
+def compare_renders(ctx: Context, before: int = -2, after: int = -1, threshold: float = 0.02) -> list:
+    """
+    Compare two renders from the history side by side: before | after | difference
+    (changed pixels in red). Returns the image plus statistics: fraction of changed
+    pixels, mean/max difference and the bounding box of the change (pixels, top-left
+    origin). Use after an iteration of the render feedback loop to see what an
+    improvement actually changed.
+
+    Parameters:
+    - before: Render number, or negative index into the history (default: -2, the previous one)
+    - after: Render number, or negative index (default: -1, the latest)
+    - threshold: Per-pixel difference (0-1) above which a pixel counts as changed
+    """
+    try:
+        blender = get_blender_connection()
+        temp_path = os.path.join(tempfile.gettempdir(), f"blender_compare_{os.getpid()}.png")
+        result = blender.send_command("compare_renders", {"before": before, "after": after,
+                                                          "threshold": threshold, "filepath": temp_path})
+        if "error" in result:
+            raise Exception(result["error"])
+        with open(temp_path, "rb") as f:
+            image_bytes = f.read()
+        os.remove(temp_path)
+        return [Image(data=image_bytes, format="png"), json.dumps(result, indent=2)]
+    except Exception as e:
+        logger.error(f"Error comparing renders: {str(e)}")
+        return [f"Error comparing renders: {str(e)}"]
 
 
 @telemetry_tool("review_render")

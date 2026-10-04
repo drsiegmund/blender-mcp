@@ -87,6 +87,11 @@ Fcurve access is slot-aware and works with layered actions (Blender 4.4+/5.x) an
 - **`plot_vector_field`** — Visualizes F(x, y, z), given as three numpy expressions, as arrows (one mesh, colored by magnitude via a viridis ramp on a `magnitude` attribute; linear or log scale, auto-selected for large ranges) and/or streamlines (RK4 along the normalized field, traced both ways from seeds on a grid, given points, or a circle/sphere around a source via `seed_radius`; lines traced twice are removed). Undefined samples (singularities) are skipped. Planar slices via equal min/max bounds.
 - **`plot_trajectory`** — Draws trajectories from points or solves dx/dt = F(x, y, z, t) with fixed-step RK4 for one or several initial conditions (each with its own color). Optional `fit_size` scaling and an animation that draws the curve in integration time with a glowing marker.
 
+- **`plot_vector_data`** — Draws precomputed vectors (inline lists, or a `.json`/`.npz` file read by Blender) as arrows colored by magnitude. Magnitudes above a percentile (default 95) are clamped so outliers near sources don't shrink the rest. Use for fields without a simple formula (e.g. computed by an external Python model).
+- **`import_scene_data`** — Builds a scene from one JSON document (file or inline) into one collection: boxes with world poses (rotation matrix + center; an optional direction draws an arrow and colors the faces it points out of red, into blue), keyframed poses per frame, per-frame text labels (visible only on their frame), timeline markers, polylines and vector fields. Blender only draws, it never computes the numbers. For static boxes it returns the pose readback error (float32, ~1e-7).
+
+Every element of `import_scene_data` and `plot_vector_data` carries a `status`: `"checked"` (default, opaque) or `"estimate"` (greyed, translucent), so estimated values are never shown like verified ones.
+
 Expressions are compiled with a whitelist of numpy functions (`sin`, `exp`, `sqrt`, `arctan2`, ...), the variables and user `params`; any other name is rejected before evaluation. Re-plotting with the same name replaces the objects and their orphaned materials, which fits the render feedback loop.
 
 ### Batch Script Execution

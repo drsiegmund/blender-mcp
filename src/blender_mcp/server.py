@@ -951,6 +951,83 @@ def plot_trajectory(ctx: Context, name: str, points: List[Any] = None, ode: List
         return f"Error plotting trajectory: {str(e)}"
 
 
+@telemetry_tool("plot_vector_data")
+@mcp.tool()
+def plot_vector_data(ctx: Context, name: str, points: List[List[float]] = None,
+                     vectors: List[List[float]] = None, filepath: str = None,
+                     normalize: bool = False, arrow_length: float = None,
+                     clamp_percentile: float = 95.0, color_scale: str = "auto",
+                     thickness: float = None, status: str = None) -> str:
+    """
+    Draw precomputed vectors (e.g. a field computed in Python) as arrows colored by
+    magnitude. Use this instead of plot_vector_field when the field has no simple formula.
+    Re-running with the same name replaces the arrows.
+
+    Parameters:
+    - name: Object name
+    - points / vectors: Lists of [x, y, z] of equal length (at most 50000)
+    - filepath: Instead of points/vectors, a .json file {"points": [...], "vectors": [...]}
+      or a .npz file with arrays "points" and "vectors" (N x 3). The path is read by
+      Blender, so it must exist on the machine running Blender. Prefer files for large data.
+    - normalize: Equal arrow length (magnitude shown by color only)
+    - arrow_length: Length of the longest arrow (default: 0.8 x mean point spacing)
+    - clamp_percentile: Magnitudes above this percentile share the maximum length and color,
+      so outliers near sources don't shrink everything else. 100 disables clamping.
+    - color_scale: "linear", "log" or "auto" (log if magnitudes span more than 100x)
+    - thickness: Arrow shaft radius (default: 6% of arrow_length)
+    - status: "checked" (default) or "estimate"; estimates are drawn greyed and translucent
+
+    Zero and non-finite vectors are skipped.
+    """
+    return _forward_command("plot_vector_data", {
+        "name": name, "points": points, "vectors": vectors, "filepath": filepath,
+        "normalize": normalize, "arrow_length": arrow_length, "clamp_percentile": clamp_percentile,
+        "color_scale": color_scale, "thickness": thickness, "status": status}, "plotting vector data")
+
+
+@telemetry_tool("import_scene_data")
+@mcp.tool()
+def import_scene_data(ctx: Context, filepath: str = None, data: Dict[str, Any] = None,
+                      replace: bool = True) -> str:
+    """
+    Build a scene from precomputed data: boxes with poses, keyframed poses over frames,
+    per-frame text labels, timeline markers, polylines and vector fields. Blender only
+    draws; every number comes from the data. Everything goes into one collection, which
+    is replaced on re-import.
+
+    Parameters:
+    - filepath: JSON file on the machine running Blender (preferred for large data)
+    - data: The same structure inline
+    - replace: Replace an existing collection of the same name
+
+    Format (all keys optional except where noted; lengths in scene units):
+    {
+      "collection": "MagnetScene",
+      "meta": {...},                      # returned unchanged, e.g. units and provenance
+      "boxes": [{"name": "a0", "half_extents": [a, b, c],          # required
+                 "center": [x, y, z], "rotation": [[3x3]],         # world pose, R maps box -> world
+                 "direction": [x, y, z],   # optional, world frame: arrow through the box, faces it
+                                           # points out of red, into blue, others grey
+                 "status": "checked" | "estimate", "color": [r, g, b]}],
+      "animation": {"frame_start": 1, "interpolation": "LINEAR",
+                    "frames": [{"a0": {"center": [...], "rotation": [[...]]}, ...}, ...]},
+      "labels": [{"name": "U", "text": "..." OR "frames": ["...", ...] (one text per frame),
+                  "frame_start": 1, "location": [x, y, z], "size": 0.2,
+                  "rotation_euler": [rx, ry, rz], "align": "LEFT", "status": "..."}],
+      "markers": [{"name": "minimum", "frame": 16}],
+      "polylines": [{"name": "...", "lines": [[[x, y, z], ...], ...], "thickness": 0.01,
+                     "color": [r, g, b], "status": "..."}],
+      "vector_fields": [{"name": "...", "points": [...], "vectors": [...], ...plot_vector_data options}]
+    }
+
+    Estimates are drawn greyed and translucent so they are never mistaken for checked
+    values. Per-frame labels are visible only on their frame. Returns counts, the frame
+    range and, for static boxes, the maximum pose readback error (float32, about 1e-7).
+    """
+    return _forward_command("import_scene_data", {"filepath": filepath, "data": data, "replace": replace},
+                            "importing scene data")
+
+
 @telemetry_tool("list_renders")
 @mcp.tool()
 def list_renders(ctx: Context) -> str:

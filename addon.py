@@ -269,6 +269,8 @@ class BlenderMCPServer:
             "set_nla_track": self.set_nla_track,
             "plot_vector_field": self.plot_vector_field,
             "plot_trajectory": self.plot_trajectory,
+            "plot_vector_data": self.plot_vector_data,
+            "import_scene_data": self.import_scene_data,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
             "get_telemetry_consent": self.get_telemetry_consent,
@@ -2319,6 +2321,359 @@ class BlenderMCPServer:
             scene.frame_set(scene.frame_current)
             result["animation"] = {"frame_start": fs, "frame_end": fe, "markers": markers}
         return result
+
+    # ---- Precomputed data (scene data import) ----
+
+    _STATUS_VALUES = ("checked", "estimate")
+
+    def _check_status(self, status):
+        if status not in (None,) + self._STATUS_VALUES:
+            raise ValueError(f"status must be one of {self._STATUS_VALUES}, got {status!r}")
+        return status or "checked"
+
+    def _set_material_alpha(self, mat, alpha):
+        """Make a node material translucent in EEVEE and Cycles."""
+        bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if bsdf is not None and "Alpha" in bsdf.inputs:
+            bsdf.inputs["Alpha"].default_value = alpha
+        if hasattr(mat, "surface_render_method"):
+            mat.surface_render_method = 'BLENDED'
+        elif hasattr(mat, "blend_method"):
+            mat.blend_method = 'BLEND'
+        mat.diffuse_color = (*mat.diffuse_color[:3], alpha)
+
+    def _status_material(self, name, color, status, emission=0.0):
+        """Opaque material for checked values; greyed, translucent material for estimates."""
+        if status == "estimate":
+            grey = sum(color[:3]) / 3
+            color = tuple(0.5 * c + 0.5 * grey for c in color[:3])
+            mat = self._solid_material(f"{name}_estimate", color, emission)
+            self._set_material_alpha(mat, 0.35)
+            return mat
+        return self._solid_material(name, color, emission)
+
+    def _load_data_file(self, filepath):
+        """Load a .json file, or a .npz file whose arrays become lists of floats."""
+        import numpy as np
+        path = os.path.expanduser(str(filepath))
+        if not os.path.isfile(path):
+            raise ValueError(f"File not found: {path}")
+        if path.endswith(".npz"):
+            with np.load(path) as npz:
+                return {key: npz[key] for key in npz.files}
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _arrow_length_for(self, points):
+        """Default arrow length: 0.8 x the mean spacing of the sample points."""
+        import numpy as np
+        extent = points.max(axis=0) - points.min(axis=0)
+        dims = extent[extent > 1e-12]
+        if len(points) < 2 or len(dims) == 0:
+            return 1.0
+        return 0.8 * float((np.prod(dims) / len(points)) ** (1.0 / len(dims)))
+
+    def plot_vector_data(self, name, points=None, vectors=None, filepath=None, normalize=False,
+                         arrow_length=None, clamp_percentile=95.0, color_scale="auto",
+                         thickness=None, status=None, collection=None):
+        """Draw precomputed vectors at given points as arrows colored by magnitude."""
+        import numpy as np
+        if filepath is not None:
+            data = self._load_data_file(filepath)
+            points, vectors = data.get("points"), data.get("vectors")
+        if points is None or vectors is None:
+            raise ValueError("Give 'points' and 'vectors' (lists of [x, y, z]) or a 'filepath'")
+        status = self._check_status(status)
+        pts = np.asarray(points, dtype=float).reshape(-1, 3)
+        vec = np.asarray(vectors, dtype=float).reshape(-1, 3)
+        if len(pts) != len(vec):
+            raise ValueError(f"points ({len(pts)}) and vectors ({len(vec)}) differ in length")
+        if len(pts) > 50000:
+            raise ValueError("At most 50000 arrows are supported")
+        mags = np.linalg.norm(vec, axis=1)
+        valid = np.isfinite(pts).all(axis=1) & np.isfinite(vec).all(axis=1) & (mags > 1e-12)
+        if not valid.any():
+            raise ValueError("All vectors are zero or non-finite")
+        pts, vec, mags = pts[valid], vec[valid], mags[valid]
+        if color_scale not in ("auto", "linear", "log"):
+            raise ValueError("color_scale must be 'auto', 'linear' or 'log'")
+        if color_scale == "auto":
+            color_scale = "log" if mags.max() / mags.min() > 100 else "linear"
+
+        # Outliers (e.g. next to a source) would shrink all other arrows: clamp at a percentile
+        clamped = 0
+        shown = mags
+        if clamp_percentile is not None and 0 < float(clamp_percentile) < 100:
+            limit = float(np.percentile(mags, float(clamp_percentile)))
+            clamped = int((mags > limit).sum())
+            shown = np.minimum(mags, limit)
+        length = float(arrow_length) if arrow_length else self._arrow_length_for(pts)
+        self._replace_object(name)
+        obj = self._build_arrows(name, pts, vec / mags[:, None] * shown[:, None], shown, length,
+                                 normalize, thickness or 0.06 * length, color_scale)
+        if status == "estimate":
+            self._set_material_alpha(obj.active_material, 0.35)
+        if collection is not None:
+            self._move_to_collection(obj, collection)
+        obj["status"] = status
+        result = {"name": obj.name, "arrows": len(pts), "skipped": int((~valid).sum()),
+                  "magnitude_range": [float(mags.min()), float(mags.max())],
+                  "arrow_length": round(length, 6), "status": status,
+                  "color": f"viridis by {color_scale} magnitude (dark = weak, yellow = strong)"}
+        if clamped:
+            result["clamped"] = {"count": clamped, "percentile": float(clamp_percentile),
+                                 "note": "arrows above the percentile share the maximum length and color"}
+        return result
+
+    def _move_to_collection(self, obj, collection):
+        for coll in list(obj.users_collection):
+            coll.objects.unlink(obj)
+        collection.objects.link(obj)
+
+    def _clear_collection(self, coll):
+        """Delete a collection with its objects, child collections and orphaned data."""
+        for child in list(coll.children):
+            self._clear_collection(child)
+        for obj in list(coll.objects):
+            self._replace_object(obj.name)
+        bpy.data.collections.remove(coll)
+
+    def _box_mesh(self, name, half, direction_local):
+        """Box mesh centered at the origin. With a direction, faces it points out of get
+        material 0, faces it points into material 1, all others material 2."""
+        hx, hy, hz = (float(h) for h in half)
+        verts = [(sx * hx, sy * hy, sz * hz) for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
+        # (face, outward normal)
+        faces = [((0, 1, 3, 2), (-1, 0, 0)), ((4, 6, 7, 5), (1, 0, 0)),
+                 ((0, 4, 5, 1), (0, -1, 0)), ((2, 3, 7, 6), (0, 1, 0)),
+                 ((0, 2, 6, 4), (0, 0, -1)), ((1, 5, 7, 3), (0, 0, 1))]
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata(verts, [], [f for f, _ in faces])
+        if direction_local is not None:
+            import numpy as np
+            d = np.asarray(direction_local, dtype=float)
+            d = d / (np.linalg.norm(d) or 1.0)
+            for poly, (_, normal) in zip(mesh.polygons, faces):
+                s = float(np.dot(normal, d))
+                poly.material_index = 0 if s > 0.05 else 1 if s < -0.05 else 2
+        mesh.update()
+        return mesh
+
+    def _pose_matrix(self, center, rotation, label):
+        import numpy as np
+        R = np.asarray(rotation if rotation is not None else np.eye(3), dtype=float)
+        c = np.asarray(center if center is not None else (0, 0, 0), dtype=float)
+        if R.shape != (3, 3) or c.shape != (3,):
+            raise ValueError(f"{label}: rotation must be 3x3 and center a 3-vector")
+        if np.abs(R.T @ R - np.eye(3)).max() > 1e-6 or np.linalg.det(R) < 0:
+            raise ValueError(f"{label}: rotation is not a proper rotation matrix")
+        return R, c
+
+    def _apply_pose(self, obj, R, c):
+        q = mathutils.Matrix(R.tolist()).to_quaternion()
+        q.make_compatible(obj.rotation_quaternion)  # shortest path between keyframes
+        obj.location = c.tolist()
+        obj.rotation_quaternion = q
+
+    def import_scene_data(self, filepath=None, data=None, replace=True):
+        """Build boxes, poses over frames, labels, markers, polylines and vector fields from
+        precomputed data. Blender only draws: all numbers come from the data."""
+        import numpy as np
+        if (filepath is None) == (data is None):
+            raise ValueError("Give either 'filepath' or 'data'")
+        if filepath is not None:
+            data = self._load_data_file(filepath)
+        scene = bpy.context.scene
+        coll_name = str(data.get("collection") or "SceneData")
+        if coll_name in bpy.data.collections:
+            if not replace:
+                raise ValueError(f"Collection '{coll_name}' exists; use replace=true")
+            self._clear_collection(bpy.data.collections[coll_name])
+        coll = bpy.data.collections.new(coll_name)
+        scene.collection.children.link(coll)
+        result = {"collection": coll.name, "objects": 0}
+
+        def link(obj):
+            coll.objects.link(obj)
+            result["objects"] += 1
+            return obj
+
+        # Boxes
+        boxes, poses = {}, {}
+        mats = {}
+        for i, box in enumerate(data.get("boxes", [])):
+            name = str(box.get("name") or f"box{i}")
+            status = self._check_status(box.get("status"))
+            R, c = self._pose_matrix(box.get("center"), box.get("rotation"), f"box '{name}'")
+            half = np.asarray(box["half_extents"], dtype=float)
+            if half.shape != (3,) or (half <= 0).any():
+                raise ValueError(f"box '{name}': half_extents must be 3 positive numbers")
+            direction = box.get("direction")
+            d_local = R.T @ np.asarray(direction, dtype=float) if direction is not None else None
+            self._replace_object(name)
+            obj = link(bpy.data.objects.new(name, self._box_mesh(name, half, d_local)))
+            key = (status, tuple(box.get("color") or ()))
+            if key not in mats:
+                base = box.get("color")
+                colors = ((0.80, 0.08, 0.06), (0.06, 0.20, 0.85), base or (0.55, 0.55, 0.58))
+                suffix = "" if not base else f"_{len(mats)}"
+                mats[key] = [self._status_material(f"{coll_name}_{role}{suffix}", col, status)
+                             for role, col in zip(("pole_out", "pole_in", "side"), colors)]
+            for mat in mats[key] if d_local is not None else mats[key][2:]:
+                obj.data.materials.append(mat)
+            obj.rotation_mode = 'QUATERNION'
+            self._apply_pose(obj, R, c)
+            obj["status"] = status
+            if d_local is not None:
+                obj["direction"] = [float(v) for v in direction]
+                arrow = self._direction_arrow(f"{name}_dir", half, d_local, status, coll_name)
+                link(arrow).parent = obj
+            boxes[name] = obj
+            poses[name] = (R, c)
+        if boxes:
+            result["boxes"] = len(boxes)
+
+        # Animation: one pose per frame for some or all boxes
+        anim = data.get("animation")
+        frame_start = None
+        if anim:
+            frames = anim.get("frames") or []
+            frame_start = int(anim.get("frame_start", 1))
+            interp = str(anim.get("interpolation", "LINEAR")).upper()
+            if interp not in ("LINEAR", "CONSTANT", "BEZIER"):
+                raise ValueError("animation.interpolation must be LINEAR, CONSTANT or BEZIER")
+            for k, poses in enumerate(frames):
+                frame = frame_start + k
+                for name, pose in poses.items():
+                    if name not in boxes:
+                        raise ValueError(f"animation frame {frame}: unknown box '{name}'")
+                    R, c = self._pose_matrix(pose.get("center"), pose.get("rotation"),
+                                             f"animation frame {frame}, box '{name}'")
+                    obj = boxes[name]
+                    self._apply_pose(obj, R, c)
+                    obj.keyframe_insert("location", frame=frame)
+                    obj.keyframe_insert("rotation_quaternion", frame=frame)
+            for obj in boxes.values():
+                for fc in self._get_fcurves(obj):
+                    for kp in fc.keyframe_points:
+                        kp.interpolation = interp
+            if frames:
+                scene.frame_start = frame_start
+                scene.frame_end = frame_start + len(frames) - 1
+                result["animation"] = {"frame_start": scene.frame_start,
+                                       "frame_end": scene.frame_end, "interpolation": interp}
+
+        # Labels: static text, or one text per animation frame (shown only on its frame)
+        labels = 0
+        for i, label in enumerate(data.get("labels", [])):
+            name = str(label.get("name") or f"label{i}")
+            status = self._check_status(label.get("status"))
+            mat = self._status_material(f"{coll_name}_text", (0.9, 0.9, 0.9), status, emission=0.5)
+            texts = label.get("frames")
+            if texts is None:
+                texts, start = [label.get("text", "")], None
+            else:
+                start = int(label.get("frame_start", frame_start or scene.frame_start))
+            for k, text in enumerate(texts):
+                obj_name = name if start is None else f"{name}_{start + k}"
+                self._replace_object(obj_name)
+                curve = bpy.data.curves.new(obj_name, 'FONT')
+                curve.body = str(text)
+                curve.size = float(label.get("size", 0.2))
+                curve.align_x = str(label.get("align", "LEFT")).upper()
+                curve.materials.append(mat)
+                obj = link(bpy.data.objects.new(obj_name, curve))
+                obj.location = label.get("location", (0, 0, 0))
+                obj.rotation_euler = label.get("rotation_euler", (1.5708, 0.0, 0.0))
+                obj["status"] = status
+                labels += 1
+                if start is not None:
+                    # Visible on its own frame only; the first and last text also hold
+                    # before and after the range (constant extrapolation)
+                    frame = start + k
+                    keys = [(frame, False)]
+                    if k > 0:
+                        keys.insert(0, (frame - 1, True))
+                    if k < len(texts) - 1:
+                        keys.append((frame + 1, True))
+                    for f, hidden in keys:
+                        obj.hide_render = obj.hide_viewport = hidden
+                        obj.keyframe_insert("hide_render", frame=f)
+                        obj.keyframe_insert("hide_viewport", frame=f)
+                    for fc in self._get_fcurves(obj):
+                        for kp in fc.keyframe_points:
+                            kp.interpolation = 'CONSTANT'
+        if labels:
+            result["labels"] = labels
+
+        # Timeline markers
+        markers = data.get("markers", [])
+        for marker in markers:
+            name = str(marker["name"])
+            for old in [m for m in scene.timeline_markers if m.name == name]:
+                scene.timeline_markers.remove(old)
+            scene.timeline_markers.new(name, frame=int(marker["frame"]))
+        if markers:
+            result["markers"] = len(markers)
+
+        # Polylines
+        for i, poly in enumerate(data.get("polylines", [])):
+            name = str(poly.get("name") or f"{coll_name}_lines{i}")
+            status = self._check_status(poly.get("status"))
+            lines = poly.get("lines") or [poly["points"]]
+            lines = [np.asarray(l, dtype=float).reshape(-1, 3) for l in lines]
+            lines = [l for l in lines if len(l) >= 2 and np.isfinite(l).all()]
+            if not lines:
+                raise ValueError(f"polyline '{name}': no line with at least 2 finite points")
+            self._replace_object(name)
+            mat = self._status_material(f"{name}_mat", poly.get("color") or (0.85, 0.85, 0.88), status)
+            obj = self._build_polyline_curve(name, lines, float(poly.get("thickness", 0.01)), [mat])
+            self._move_to_collection(obj, coll)
+            obj["status"] = status
+            result["objects"] += 1
+            result.setdefault("polylines", []).append({"name": obj.name, "lines": len(lines)})
+
+        # Vector fields
+        for i, field in enumerate(data.get("vector_fields", [])):
+            kwargs = {k: field[k] for k in ("points", "vectors", "normalize", "arrow_length",
+                                            "clamp_percentile", "color_scale", "thickness", "status")
+                      if k in field}
+            info = self.plot_vector_data(str(field.get("name") or f"{coll_name}_field{i}"),
+                                         collection=coll, **kwargs)
+            result["objects"] += 1
+            result.setdefault("vector_fields", []).append(info)
+
+        if frame_start is not None:
+            scene.frame_set(scene.frame_start)
+        # Readback: Blender stores transforms in float32, so expect ~1e-7
+        bpy.context.view_layer.update()
+        if boxes and not anim:
+            err = 0.0
+            for name, (R, c) in poses.items():
+                m = np.array(boxes[name].matrix_world)
+                err = max(err, float(np.abs(m[:3, :3] - R).max()), float(np.abs(m[:3, 3] - c).max()))
+            result["pose_readback_max_error"] = err
+        result["meta"] = data.get("meta", {})
+        return result
+
+    def _direction_arrow(self, name, half, d_local, status, coll_name):
+        """Arrow through the box center along a direction given in box coordinates."""
+        import numpy as np
+        d = np.asarray(d_local, dtype=float)
+        d = d / (np.linalg.norm(d) or 1.0)
+        length = 1.8 * float(max(half))
+        width = 4.0 * float(min(half))  # head radius = 0.4 x smallest half extent
+        tmpl_v, tmpl_f = self._arrow_template()
+        verts = tmpl_v * np.array([width, width, length])
+        verts[:, 2] -= length / 2
+        verts = verts @ self._rotations_to(d[None])[0].T
+        self._replace_object(name)
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata(verts.tolist(), [], tmpl_f)
+        mesh.update()
+        mesh.materials.append(self._status_material(f"{coll_name}_direction", (0.95, 0.85, 0.2),
+                                                    status, emission=0.5))
+        return bpy.data.objects.new(name, mesh)
 
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""

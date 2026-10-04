@@ -46,6 +46,13 @@ plot_vector_field(field=["-y", "x", "0"], ...)  →  render_scene  →  review_r
 plot_trajectory(ode=["sigma*(y-x)", "x*(rho-z)-y", "x*y-beta*z"], animate=True, ...)
 ```
 
+### Precomputed Data
+Draw results computed elsewhere: `plot_vector_data` turns points and vectors (inline or a `.json`/`.npz` file) into colored arrows, and `import_scene_data` builds boxes with poses, keyframed motion, per-frame labels, timeline markers, polylines and vector fields from one JSON document. Each element is marked `checked` or `estimate`; estimates are drawn greyed and translucent.
+
+```
+python my_model.py > scene.json  →  import_scene_data(filepath="scene.json")  →  render_animation_preview
+```
+
 ### Constraints & Modifiers
 Snapshots and diffs now capture object constraints (Track To, Follow Path, Copy Location, etc.) and modifiers (Subdivision, Array, Mirror, Solidify, etc.) with type-specific parameters. Essential for animation workflows where camera paths are driven by constraints.
 
@@ -84,6 +91,8 @@ Snapshots and diffs now capture object constraints (Track To, Follow Path, Copy 
 | `remove_nla` | Remove an NLA strip or track |
 | `plot_vector_field` | Vector field as colored arrows and/or streamlines |
 | `plot_trajectory` | Trajectories from points or an ODE (RK4), optionally animated |
+| `plot_vector_data` | Precomputed vectors as colored arrows (inline, JSON or NPZ) |
+| `import_scene_data` | Boxes, poses, keyframes, labels, markers, polylines from JSON |
 | `set_visibility` | Show or hide objects in renders and viewport |
 | `get_scene_info` | Quick scene overview (object count, materials) |
 | `get_object_info` | Detailed info for a single object (incl. constraints, modifiers) |

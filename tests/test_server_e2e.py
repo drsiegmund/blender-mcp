@@ -85,6 +85,19 @@ def test_visualization_tools_roundtrip(blender):
                                bounds=[[0, 1], [0, 1], [0, 0]]).startswith("Error")
 
 
+def test_scene_data_tools_roundtrip(blender, tmp_path):
+    path = tmp_path / "scene.json"
+    path.write_text(json.dumps({"collection": "E2E", "boxes": [
+        {"name": "q", "half_extents": [0.3, 0.2, 0.1], "center": [1, 0, 0], "direction": [0, 0, 1]}],
+        "markers": [{"name": "m", "frame": 3}]}))
+    r = json.loads(S.import_scene_data(None, filepath=str(path)))
+    assert r["boxes"] == 1 and r["markers"] == 1 and r["pose_readback_max_error"] < 1e-6
+    r = json.loads(S.plot_vector_data(None, name="V", points=[[0, 0, 0], [1, 0, 0]],
+                                      vectors=[[0, 0, 1], [0, 1, 0]], status="estimate"))
+    assert r["arrows"] == 2 and r["status"] == "estimate"
+    assert S.import_scene_data(None).startswith("Error")
+
+
 def test_compare_renders_roundtrip(blender):
     for _ in range(2):
         S.render_animation_preview(None, num_frames=1, resolution_x=32, resolution_y=18,

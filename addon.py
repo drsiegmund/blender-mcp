@@ -54,6 +54,8 @@ class BlenderMCPServer:
         self._batch_status = None
         self._batch_result = None
         self._batch_id = None
+        self._preview_job = None
+        self._render_history = []
 
     def _make_depsgraph_handler(self):
         """Create a closure that captures self for use as a bpy.app.handlers callback."""
@@ -249,8 +251,24 @@ class BlenderMCPServer:
             "clear_change_log": self.clear_change_log,
             "render_scene": self.render_scene,
             "poll_render_status": self.poll_render_status,
+            "render_animation_preview": self.render_animation_preview,
+            "list_renders": self.list_renders,
+            "compare_renders": self.compare_renders,
             "execute_batch_script": self.execute_batch_script,
             "poll_batch_status": self.poll_batch_status,
+            "insert_keyframes": self.insert_keyframes,
+            "delete_keyframes": self.delete_keyframes,
+            "get_animation_data": self.get_animation_data,
+            "set_timeline": self.set_timeline,
+            "scrub_timeline": self.scrub_timeline,
+            "set_visibility": self.set_visibility,
+            "push_action_to_nla": self.push_action_to_nla,
+            "add_nla_strip": self.add_nla_strip,
+            "update_nla_strip": self.update_nla_strip,
+            "remove_nla": self.remove_nla,
+            "set_nla_track": self.set_nla_track,
+            "plot_vector_field": self.plot_vector_field,
+            "plot_trajectory": self.plot_trajectory,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
             "get_telemetry_consent": self.get_telemetry_consent,
@@ -422,36 +440,55 @@ class BlenderMCPServer:
             return "BLENDER_EEVEE"
         return "CYCLES"
 
-    def _get_fcurves(self, action):
-        """Get fcurves from an action, handling both layered (Blender 4.x) and legacy actions."""
-        if hasattr(action, 'is_action_layered') and action.is_action_layered:
-            try:
-                return action.layers[0].strips[0].channelbags[0].fcurves
-            except (IndexError, AttributeError):
-                return []
-        if hasattr(action, 'fcurves'):
-            return action.fcurves
-        return []
+    def _get_fcurve_collection(self, id_block):
+        """Get the fcurve collection animating an ID block (object, light, camera, ...).
+
+        Handles layered actions with slots (Blender 4.4+) and legacy actions.
+        Returns None if the ID has no action.
+        """
+        anim = getattr(id_block, "animation_data", None)
+        if not anim or not anim.action:
+            return None
+        action = anim.action
+        if getattr(action, "is_action_layered", False):
+            slot = getattr(anim, "action_slot", None)
+            for layer in action.layers:
+                for strip in layer.strips:
+                    if slot is not None:
+                        channelbag = strip.channelbag(slot)
+                    else:
+                        channelbag = strip.channelbags[0] if len(strip.channelbags) else None
+                    if channelbag:
+                        return channelbag.fcurves
+            return None
+        return getattr(action, "fcurves", None)
+
+    def _get_fcurves(self, id_block):
+        """Get the fcurves animating an ID block as a list."""
+        fcurves = self._get_fcurve_collection(id_block)
+        return list(fcurves) if fcurves is not None else []
+
+    def _get_anim_targets(self, obj):
+        """Yield (id_block, path_prefix) for an object and its data block."""
+        yield obj, ""
+        if obj.data is not None and hasattr(obj.data, "animation_data"):
+            yield obj.data, "data."
 
     def _get_keyframes(self, obj):
-        """Extract keyframe data for an object, grouped by data_path."""
+        """Extract keyframe frames for an object and its data, grouped by data_path."""
         keyframes = {}
-        if not obj.animation_data or not obj.animation_data.action:
-            return keyframes
-        fcurves = self._get_fcurves(obj.animation_data.action)
-        for fc in fcurves:
-            path = fc.data_path
-            frames = sorted(set(round(kf.co[0]) for kf in fc.keyframe_points))
-            if path in keyframes:
-                keyframes[path] = sorted(set(keyframes[path] + frames))
-            else:
-                keyframes[path] = frames
+        for target, prefix in self._get_anim_targets(obj):
+            for fc in self._get_fcurves(target):
+                path = prefix + fc.data_path
+                frames = sorted(set(round(kf.co[0]) for kf in fc.keyframe_points))
+                keyframes[path] = sorted(set(keyframes.get(path, []) + frames))
         return keyframes
 
     def _get_material_props(self, mat):
         """Extract Principled BSDF properties from a material."""
         props = {"base_color": None, "roughness": None, "metallic": None, "transmission": None}
-        if not mat.use_nodes or not mat.node_tree:
+        # Blender 5.0+ always uses nodes and deprecates use_nodes
+        if not mat.node_tree or (bpy.app.version < (5, 0, 0) and not mat.use_nodes):
             return props
         for node in mat.node_tree.nodes:
             if node.type == 'BSDF_PRINCIPLED':
@@ -550,8 +587,10 @@ class BlenderMCPServer:
             "materials": {},
             "cameras": {},
             "lights": {},
+            "world": self._get_world_props(scene.world),
         }
 
+        used_materials = set()
         for obj in scene.objects:
             obj_data = {
                 "type": obj.type,
@@ -559,6 +598,7 @@ class BlenderMCPServer:
                 "rotation": self._round_vec(obj.rotation_euler),
                 "scale": self._round_vec(obj.scale),
                 "visible": obj.visible_get(),
+                "hide_render": obj.hide_render,
                 "parent": obj.parent.name if obj.parent else None,
                 "children": [c.name for c in obj.children],
                 "materials": [slot.material.name for slot in obj.material_slots if slot.material],
@@ -567,14 +607,19 @@ class BlenderMCPServer:
                 "modifiers": self._get_modifiers(obj),
             }
             snapshot["objects"][obj.name] = obj_data
+            used_materials.update(slot.material for slot in obj.material_slots if slot.material)
 
             if obj.type == 'CAMERA' and obj.data:
                 snapshot["cameras"][obj.name] = {
                     "location": self._round_vec(obj.location),
                     "rotation": self._round_vec(obj.rotation_euler),
+                    "type": obj.data.type,
                     "focal_length": round(float(obj.data.lens), 4),
+                    "ortho_scale": round(float(obj.data.ortho_scale), 4),
                     "sensor_width": round(float(obj.data.sensor_width), 4),
                     "sensor_height": round(float(obj.data.sensor_height), 4),
+                    "clip_start": round(float(obj.data.clip_start), 4),
+                    "clip_end": round(float(obj.data.clip_end), 4),
                 }
 
             if obj.type == 'LIGHT' and obj.data:
@@ -586,10 +631,39 @@ class BlenderMCPServer:
                     "energy": round(float(obj.data.energy), 4),
                 }
 
-        for mat in bpy.data.materials:
+        # Only materials used in this scene, not every material in the file
+        for mat in sorted(used_materials, key=lambda m: m.name):
             snapshot["materials"][mat.name] = self._get_material_props(mat)
 
         return snapshot
+
+    def _get_world_props(self, world):
+        if world is None:
+            return None
+        props = {"name": world.name, "color": self._round_vec(world.color), "background": None, "strength": None}
+        if world.node_tree:
+            bg = next((n for n in world.node_tree.nodes if n.type == 'BACKGROUND'), None)
+            if bg:
+                props["background"] = self._round_vec(bg.inputs["Color"].default_value)
+                props["strength"] = round(float(bg.inputs["Strength"].default_value), 4)
+        return props
+
+    # Snapshot property -> animated data path, to flag changes caused by animation
+    _ANIMATED_PATHS = {
+        "location": "location", "rotation": "rotation_euler", "scale": "scale",
+        "hide_render": "hide_render", "visible": "hide_viewport",
+        "focal_length": "data.lens", "ortho_scale": "data.ortho_scale",
+        "energy": "data.energy", "color": "data.color",
+    }
+
+    def _flag_animated(self, changes, keyframes):
+        """Mark changed properties that are animated (their value depends on the frame)."""
+        animated = 0
+        for prop, change in changes.items():
+            if self._ANIMATED_PATHS.get(prop) in keyframes:
+                change["animated"] = True
+                animated += 1
+        return animated == len(changes)
 
     def snapshot_scene(self):
         """Take a snapshot of the current scene and store it as baseline."""
@@ -640,11 +714,15 @@ class BlenderMCPServer:
             diff["added_objects"] = sorted(new_objs - old_objs)
             diff["removed_objects"] = sorted(old_objs - new_objs)
 
-            obj_props = ["location", "rotation", "scale", "visible", "parent", "materials", "constraints", "modifiers"]
+            obj_props = ["location", "rotation", "scale", "visible", "hide_render", "parent", "materials",
+                         "constraints", "modifiers"]
+            animation_only = 0
             for name in old_objs & new_objs:
                 changes = self._diff_dicts(old["objects"][name], current["objects"][name], obj_props)
                 if changes:
                     diff["modified_objects"][name] = changes
+                    if self._flag_animated(changes, current["objects"][name].get("keyframes", {})):
+                        animation_only += 1
 
             # Materials
             old_mats = set(old["materials"].keys())
@@ -659,11 +737,13 @@ class BlenderMCPServer:
                     diff["modified_materials"][name] = changes
 
             # Cameras
-            cam_props = ["location", "rotation", "focal_length", "sensor_width", "sensor_height"]
+            cam_props = ["location", "rotation", "type", "focal_length", "ortho_scale", "sensor_width",
+                         "sensor_height", "clip_start", "clip_end"]
             for name in set(old["cameras"].keys()) & set(current["cameras"].keys()):
                 changes = self._diff_dicts(old["cameras"][name], current["cameras"][name], cam_props)
                 if changes:
                     diff["camera_changes"][name] = changes
+                    self._flag_animated(changes, current["objects"].get(name, {}).get("keyframes", {}))
 
             # Lights
             light_props = ["location", "rotation", "light_type", "color", "energy"]
@@ -671,6 +751,16 @@ class BlenderMCPServer:
                 changes = self._diff_dicts(old["lights"][name], current["lights"][name], light_props)
                 if changes:
                     diff["light_changes"][name] = changes
+                    self._flag_animated(changes, current["objects"].get(name, {}).get("keyframes", {}))
+
+            # World
+            old_world, new_world = old.get("world"), current.get("world")
+            if old_world != new_world:
+                if old_world is None or new_world is None:
+                    diff["world_changes"] = {"world": {"old": old_world, "new": new_world}}
+                else:
+                    diff["world_changes"] = self._diff_dicts(old_world, new_world,
+                                                             ["name", "color", "background", "strength"])
 
             # Timeline
             timeline_props = ["frame_start", "frame_end", "fps"]
@@ -696,7 +786,8 @@ class BlenderMCPServer:
             if diff["removed_objects"]:
                 parts.append(f"{len(diff['removed_objects'])} removed")
             if diff["modified_objects"]:
-                parts.append(f"{len(diff['modified_objects'])} modified")
+                note = f" ({animation_only} only in animated properties)" if animation_only else ""
+                parts.append(f"{len(diff['modified_objects'])} modified{note}")
             if diff["added_materials"] or diff["removed_materials"] or diff["modified_materials"]:
                 mat_count = len(diff["added_materials"]) + len(diff["removed_materials"]) + len(diff["modified_materials"])
                 parts.append(f"{mat_count} material(s) changed")
@@ -704,6 +795,8 @@ class BlenderMCPServer:
                 parts.append("camera changed")
             if diff["light_changes"]:
                 parts.append("lights changed")
+            if diff.get("world_changes"):
+                parts.append("world changed")
             if diff["timeline_changes"]:
                 parts.append("timeline changed")
             if diff["keyframe_changes"]:
@@ -835,20 +928,10 @@ class BlenderMCPServer:
         except Exception as e:
             return {"error": str(e)}
 
-    def render_scene(self, filepath=None, resolution_x=1280, resolution_y=720,
-                     engine="EEVEE", samples=None):
-        """Start an async render and return immediately."""
-        import uuid as _uuid
-        if not filepath:
-            return {"error": "No filepath provided"}
-
-        if self._render_status == "rendering":
-            return {"error": "A render is already in progress", "render_id": self._render_id}
-
+    def _apply_render_settings(self, engine, resolution_x, resolution_y, samples):
+        """Apply render settings and return (saved_settings, engine_id, samples_used)."""
         scene = bpy.context.scene
         render = scene.render
-
-        # Save current settings
         saved = {
             "engine": render.engine,
             "resolution_x": render.resolution_x,
@@ -860,13 +943,11 @@ class BlenderMCPServer:
             "cycles_samples": scene.cycles.samples if hasattr(scene, 'cycles') else None,
         }
 
-        # Set render settings
         engine_id = self._get_engine_id(engine)
         render.engine = engine_id
         render.resolution_x = resolution_x
         render.resolution_y = resolution_y
         render.resolution_percentage = 100
-        render.filepath = filepath
         render.image_settings.file_format = 'PNG'
 
         if engine.upper() == "EEVEE":
@@ -876,6 +957,34 @@ class BlenderMCPServer:
         else:
             s = min(samples or 64, 256)
             scene.cycles.samples = s
+        return saved, engine_id, s
+
+    def _restore_render_settings(self, saved):
+        scene = bpy.context.scene
+        render = scene.render
+        render.engine = saved["engine"]
+        render.resolution_x = saved["resolution_x"]
+        render.resolution_y = saved["resolution_y"]
+        render.resolution_percentage = saved["resolution_percentage"]
+        render.filepath = saved["filepath"]
+        render.image_settings.file_format = saved["file_format"]
+        if saved["eevee_samples"] is not None and hasattr(scene.eevee, 'taa_render_samples'):
+            scene.eevee.taa_render_samples = saved["eevee_samples"]
+        if saved["cycles_samples"] is not None and hasattr(scene, 'cycles'):
+            scene.cycles.samples = saved["cycles_samples"]
+
+    def render_scene(self, filepath=None, resolution_x=1280, resolution_y=720,
+                     engine="EEVEE", samples=None):
+        """Start an async render and return immediately."""
+        import uuid as _uuid
+        if not filepath:
+            return {"error": "No filepath provided"}
+
+        if self._render_status == "rendering":
+            return {"error": "A render is already in progress", "render_id": self._render_id}
+
+        saved, engine_id, s = self._apply_render_settings(engine, resolution_x, resolution_y, samples)
+        bpy.context.scene.render.filepath = filepath
 
         # Set async render state
         self._render_id = str(_uuid.uuid4())
@@ -894,27 +1003,309 @@ class BlenderMCPServer:
                     "height": resolution_y, "engine": engine,
                 }
                 server_ref._last_render_path = filepath
+                with suppress(OSError):  # history is best effort; the render itself succeeded
+                    server_ref._remember_render(filepath, {"type": "render", "engine": engine,
+                                                           "width": resolution_x, "height": resolution_y})
                 print("Render complete")
             except Exception as e:
                 server_ref._render_status = "failed"
                 server_ref._render_result = {"error": str(e)}
                 print(f"Render failed: {str(e)}")
             finally:
-                render.engine = saved["engine"]
-                render.resolution_x = saved["resolution_x"]
-                render.resolution_y = saved["resolution_y"]
-                render.resolution_percentage = saved["resolution_percentage"]
-                render.filepath = saved["filepath"]
-                render.image_settings.file_format = saved["file_format"]
-                if saved["eevee_samples"] is not None and hasattr(scene.eevee, 'taa_render_samples'):
-                    scene.eevee.taa_render_samples = saved["eevee_samples"]
-                if saved["cycles_samples"] is not None and hasattr(scene, 'cycles'):
-                    scene.cycles.samples = saved["cycles_samples"]
+                server_ref._restore_render_settings(saved)
             return None
 
         bpy.app.timers.register(_do_render, first_interval=0.1)
 
         return {"status": "started", "render_id": self._render_id}
+
+    # ---- Render history & comparison ----
+
+    _RENDER_HISTORY_SIZE = 20
+
+    def _history_dir(self):
+        path = os.path.join(tempfile.gettempdir(), f"blender_mcp_history_{os.getpid()}")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _remember_render(self, filepath, info):
+        """Keep a copy of a finished render so later renders don't overwrite it."""
+        from datetime import datetime
+        number = self._render_history[-1]["number"] + 1 if self._render_history else 1
+        copy_path = os.path.join(self._history_dir(), f"render_{number:03d}.png")
+        shutil.copyfile(filepath, copy_path)
+        entry = dict(info, number=number, filepath=copy_path,
+                     time=datetime.now().isoformat(timespec="seconds"))
+        if "frames" not in entry:  # previews list their frames; a still shows the current one
+            entry["frame"] = bpy.context.scene.frame_current
+        self._render_history.append(entry)
+        while len(self._render_history) > self._RENDER_HISTORY_SIZE:
+            old = self._render_history.pop(0)
+            with suppress(OSError):
+                os.remove(old["filepath"])
+        return entry
+
+    def list_renders(self):
+        return {"renders": [{k: v for k, v in e.items() if k != "filepath"} for e in self._render_history]}
+
+    def _find_render(self, ref):
+        """ref: render number (>= 1) or negative index into the history (-1 = latest)."""
+        ref = int(ref)
+        if ref < 0:
+            if -ref > len(self._render_history):
+                raise ValueError(f"Only {len(self._render_history)} render(s) in the history")
+            return self._render_history[ref]
+        for entry in self._render_history:
+            if entry["number"] == ref:
+                return entry
+        raise ValueError(f"Render #{ref} is not in the history (see list_renders)")
+
+    def _load_rgba(self, path):
+        import numpy as np
+        img = bpy.data.images.load(path, check_existing=False)
+        try:
+            w, h = img.size
+            buf = np.empty(w * h * 4, dtype=np.float32)
+            img.pixels.foreach_get(buf)
+            return buf.reshape(h, w, 4)
+        finally:
+            bpy.data.images.remove(img)
+
+    def compare_renders(self, before=-2, after=-1, filepath=None, threshold=0.02):
+        """Compose before | after | difference and measure how much changed."""
+        import numpy as np
+        if not filepath:
+            return {"error": "No filepath provided"}
+        a_entry, b_entry = self._find_render(before), self._find_render(after)
+        a, b = self._load_rgba(a_entry["filepath"]), self._load_rgba(b_entry["filepath"])
+        if a.shape != b.shape:
+            # Nearest-neighbour resize of "before" to the size of "after"
+            ys = (np.arange(b.shape[0]) * a.shape[0] / b.shape[0]).astype(int)
+            xs = (np.arange(b.shape[1]) * a.shape[1] / b.shape[1]).astype(int)
+            a = a[ys][:, xs]
+
+        diff = np.abs(a[..., :3] - b[..., :3]).mean(axis=2)
+        changed = diff > threshold
+        gray = b[..., :3].mean(axis=2, keepdims=True) * 0.35
+        heat = np.clip(diff / max(float(diff.max()), threshold * 5), 0, 1)[..., None]
+        diff_panel = np.concatenate([gray * (1 - heat) + heat * np.array([1.0, 0.1, 0.1]),
+                                     np.ones(diff.shape + (1,))], axis=2)
+
+        h, w = b.shape[:2]
+        gap = 4
+        sheet = np.empty((h + 2 * gap, 3 * w + 4 * gap, 4), dtype=np.float32)
+        sheet[:] = (0.15, 0.15, 0.15, 1.0)
+        label_scale = max(2, h // 60)
+        for i, (panel, label) in enumerate([(a, str(a_entry["number"])), (b, str(b_entry["number"])),
+                                            (diff_panel, None)]):
+            tile = panel.astype(np.float32).copy()
+            tile[..., 3] = 1.0
+            if label:
+                self._draw_label(tile, label, label_scale)
+            x0 = gap + i * (w + gap)
+            sheet[gap:gap + h, x0:x0 + w] = tile
+
+        out = bpy.data.images.new("MCP_Compare", sheet.shape[1], sheet.shape[0], alpha=True)
+        try:
+            out.pixels.foreach_set(sheet.ravel())
+            out.filepath_raw = filepath
+            out.file_format = 'PNG'
+            out.save()
+        finally:
+            bpy.data.images.remove(out)
+
+        result = {
+            "filepath": filepath,
+            "before": {k: v for k, v in a_entry.items() if k != "filepath"},
+            "after": {k: v for k, v in b_entry.items() if k != "filepath"},
+            "layout": "before | after | difference (red = changed); panels labeled with render numbers",
+            "changed_fraction": round(float(changed.mean()), 4),
+            "mean_difference": round(float(diff.mean()), 4),
+            "max_difference": round(float(diff.max()), 4),
+        }
+        if result["changed_fraction"] > 0.9:
+            result["note"] = ("Almost every pixel changed: framing, camera or background probably differ, "
+                              "so compare the panels visually rather than by the numbers.")
+        if changed.any():
+            rows, cols = np.nonzero(changed)
+            # Image rows are stored bottom-up; report the box with a top-left origin
+            result["changed_bbox"] = {"x_min": int(cols.min()), "x_max": int(cols.max()),
+                                      "y_min": int(h - 1 - rows.max()), "y_max": int(h - 1 - rows.min())}
+        return result
+
+    # ---- Animation preview (contact sheet) ----
+
+    # 3x5 bitmap digits for frame labels, rows top to bottom
+    _DIGITS = {
+        "0": ["111", "101", "101", "101", "111"], "1": ["010", "110", "010", "010", "111"],
+        "2": ["111", "001", "111", "100", "111"], "3": ["111", "001", "111", "001", "111"],
+        "4": ["101", "101", "111", "001", "001"], "5": ["111", "100", "111", "001", "111"],
+        "6": ["111", "100", "111", "101", "111"], "7": ["111", "001", "010", "010", "010"],
+        "8": ["111", "101", "111", "101", "111"], "9": ["111", "101", "111", "001", "111"],
+        "-": ["000", "000", "111", "000", "000"],
+    }
+
+    def _preview_frames(self, frame_start, frame_end, num_frames):
+        if num_frames <= 1 or frame_start == frame_end:
+            return [frame_start]
+        step = (frame_end - frame_start) / (num_frames - 1)
+        frames = [int(round(frame_start + i * step)) for i in range(num_frames)]
+        return sorted(set(frames))
+
+    def _draw_label(self, tile, text, scale):
+        """Draw text (digits) into the top-left corner of an RGBA tile (rows bottom-up)."""
+        h = tile.shape[0]
+        glyph_w, glyph_h = 3 * scale, 5 * scale
+        pad = scale
+        box_w = len(text) * (glyph_w + scale) + pad
+        box_h = glyph_h + 2 * pad
+        if box_w > tile.shape[1] or box_h > h:
+            return
+        tile[h - box_h:h, 0:box_w] = (0.0, 0.0, 0.0, 1.0)
+        for i, ch in enumerate(text):
+            pattern = self._DIGITS.get(ch)
+            if not pattern:
+                continue
+            x0 = pad + i * (glyph_w + scale)
+            for row, bits in enumerate(pattern):
+                for col, bit in enumerate(bits):
+                    if bit == "1":
+                        y_top = h - pad - row * scale
+                        tile[y_top - scale:y_top, x0 + col * scale:x0 + (col + 1) * scale] = (1.0, 1.0, 1.0, 1.0)
+
+    def _compose_contact_sheet(self, frame_paths, frames, columns, filepath):
+        """Compose rendered frames into one labeled grid image. Returns (columns, rows)."""
+        import numpy as np
+        n = len(frame_paths)
+        cols = max(1, min(columns or int(np.ceil(np.sqrt(n))), n))
+        rows = int(np.ceil(n / cols))
+        gap = 4
+
+        tiles = []
+        for path in frame_paths:
+            img = bpy.data.images.load(path, check_existing=False)
+            try:
+                w, h = img.size
+                buf = np.empty(w * h * 4, dtype=np.float32)
+                img.pixels.foreach_get(buf)
+                tiles.append(buf.reshape(h, w, 4))
+            finally:
+                bpy.data.images.remove(img)
+
+        h, w = tiles[0].shape[:2]
+        sheet_w = cols * w + (cols + 1) * gap
+        sheet_h = rows * h + (rows + 1) * gap
+        sheet = np.empty((sheet_h, sheet_w, 4), dtype=np.float32)
+        sheet[:] = (0.15, 0.15, 0.15, 1.0)
+        label_scale = max(2, h // 60)
+        for i, (tile, frame) in enumerate(zip(tiles, frames)):
+            tile = tile.copy()
+            tile[..., 3] = 1.0
+            self._draw_label(tile, str(frame), label_scale)
+            r, c = divmod(i, cols)
+            # Image rows are stored bottom-up; row 0 of the grid is at the top
+            y0 = gap + (rows - 1 - r) * (h + gap)
+            x0 = gap + c * (w + gap)
+            sheet[y0:y0 + h, x0:x0 + w] = tile
+
+        out = bpy.data.images.new("MCP_ContactSheet", sheet_w, sheet_h, alpha=True)
+        try:
+            out.pixels.foreach_set(sheet.ravel())
+            out.filepath_raw = filepath
+            out.file_format = 'PNG'
+            out.save()
+        finally:
+            bpy.data.images.remove(out)
+        return cols, rows
+
+    def render_animation_preview(self, filepath=None, frame_start=None, frame_end=None,
+                                 num_frames=9, columns=None, resolution_x=480,
+                                 resolution_y=270, engine="EEVEE", samples=None):
+        """Start rendering sampled frames into a contact sheet; poll with poll_render_status."""
+        import uuid as _uuid
+        if not filepath:
+            return {"error": "No filepath provided"}
+        if self._render_status == "rendering":
+            return {"error": "A render is already in progress", "render_id": self._render_id}
+
+        scene = bpy.context.scene
+        start = scene.frame_start if frame_start is None else int(frame_start)
+        end = scene.frame_end if frame_end is None else int(frame_end)
+        if start > end:
+            return {"error": f"frame_start ({start}) must not be greater than frame_end ({end})"}
+        num_frames = max(1, min(int(num_frames), 25))
+        frames = self._preview_frames(start, end, num_frames)
+
+        saved, engine_id, s = self._apply_render_settings(engine, resolution_x, resolution_y, samples)
+        base, _ = os.path.splitext(filepath)
+        self._preview_job = {
+            "frames": frames,
+            "paths": [f"{base}_f{frame:05d}.png" for frame in frames],
+            "next": 0,
+            "saved": saved,
+            "frame_current": scene.frame_current,
+            "filepath": filepath,
+            "columns": columns,
+            "engine": engine,
+            "samples": s,
+            "tile_size": [resolution_x, resolution_y],
+        }
+        self._render_id = str(_uuid.uuid4())
+        self._render_status = "rendering"
+        self._render_result = {"type": "animation_preview", "frames_done": 0, "frames_total": len(frames)}
+
+        bpy.app.timers.register(self._preview_step, first_interval=0.1)
+        return {"status": "started", "render_id": self._render_id, "frames": frames,
+                "engine": engine_id, "samples": s}
+
+    def _preview_step(self):
+        """Render one preview frame per timer tick so polls are answered in between."""
+        job = self._preview_job
+        if job is None:
+            return None
+        scene = bpy.context.scene
+        try:
+            i = job["next"]
+            if i < len(job["frames"]):
+                scene.frame_set(job["frames"][i])
+                scene.render.filepath = job["paths"][i]
+                bpy.ops.render.render(write_still=True)
+                job["next"] = i + 1
+                self._render_result["frames_done"] = i + 1
+                return 0.01
+
+            cols, rows = self._compose_contact_sheet(job["paths"], job["frames"], job["columns"], job["filepath"])
+            self._render_status = "completed"
+            self._render_result = {
+                "type": "animation_preview",
+                "filepath": job["filepath"],
+                "frames": job["frames"],
+                "columns": cols,
+                "rows": rows,
+                "tile_size": job["tile_size"],
+                "engine": job["engine"],
+                "samples": job["samples"],
+                "layout": "row-major, top-left first; each tile is labeled with its frame number",
+            }
+            self._last_render_path = job["filepath"]
+            with suppress(OSError):
+                self._remember_render(job["filepath"], {"type": "animation_preview", "frames": job["frames"]})
+        except Exception as e:
+            traceback.print_exc()
+            self._render_status = "failed"
+            self._render_result = {"type": "animation_preview", "error": str(e)}
+        self._finish_preview_job()
+        return None
+
+    def _finish_preview_job(self):
+        job = self._preview_job
+        self._preview_job = None
+        scene = bpy.context.scene
+        self._restore_render_settings(job["saved"])
+        scene.frame_set(job["frame_current"])
+        for path in job["paths"]:
+            with suppress(OSError):
+                os.remove(path)
 
     def poll_render_status(self):
         """Poll the status of an async render."""
@@ -968,6 +1359,966 @@ class BlenderMCPServer:
             "status": self._batch_status or "idle",
             "result": self._batch_result,
         }
+
+    # ---- Animation & Timeline ----
+
+    _INTERPOLATIONS = {
+        'CONSTANT', 'LINEAR', 'BEZIER', 'SINE', 'QUAD', 'CUBIC', 'QUART',
+        'QUINT', 'EXPO', 'CIRC', 'BACK', 'BOUNCE', 'ELASTIC',
+    }
+
+    def _get_object(self, object_name):
+        obj = bpy.data.objects.get(object_name)
+        if not obj:
+            raise ValueError(f"Object not found: {object_name}")
+        return obj
+
+    def _resolve_anim_target(self, obj, data_path):
+        """Map a data_path to (id_block, path). A "data." prefix targets obj.data."""
+        if data_path.startswith("data."):
+            if obj.data is None:
+                raise ValueError(f"Object '{obj.name}' has no data block")
+            return obj.data, data_path[len("data."):]
+        return obj, data_path
+
+    def _set_path_value(self, target, path, value, index):
+        """Set the value of an animatable property given by an RNA path."""
+        custom = re.match(r'^(.*)\[(["\'])(.+)\2\]$', path)
+        if custom:
+            owner = target.path_resolve(custom.group(1)) if custom.group(1) else target
+            key = custom.group(3)
+            if index >= 0:
+                owner[key][index] = value
+            else:
+                owner[key] = value
+            return
+        match = re.match(r'^(.*?)\.?([A-Za-z_]\w*)$', path)
+        if not match:
+            raise ValueError(f"Unsupported data_path: {path}")
+        owner = target.path_resolve(match.group(1)) if match.group(1) else target
+        attr = match.group(2)
+        if index >= 0:
+            getattr(owner, attr)[index] = value
+        else:
+            setattr(owner, attr, value)
+
+    def _serialize_fcurve(self, fc, prefix="", max_keyframes=100):
+        points = fc.keyframe_points
+        data = {
+            "data_path": prefix + fc.data_path,
+            "index": fc.array_index,
+            "keyframe_count": len(points),
+            "extrapolation": fc.extrapolation,
+            "keyframes": [
+                {
+                    "frame": round(float(kp.co[0]), 3),
+                    "value": round(float(kp.co[1]), 4),
+                    "interpolation": kp.interpolation,
+                }
+                for kp in list(points)[:max_keyframes]
+            ],
+        }
+        if len(points) > max_keyframes:
+            data["truncated"] = True
+        if fc.mute:
+            data["mute"] = True
+        return data
+
+    def _serialize_nla(self, anim):
+        tracks = []
+        if not anim:
+            return tracks
+        for track in anim.nla_tracks:
+            tracks.append({
+                "name": track.name,
+                "mute": track.mute,
+                "is_solo": track.is_solo,
+                "strips": [
+                    {
+                        "name": strip.name,
+                        "action": strip.action.name if strip.action else None,
+                        "frame_start": round(float(strip.frame_start), 3),
+                        "frame_end": round(float(strip.frame_end), 3),
+                        "blend_type": strip.blend_type,
+                        "repeat": round(float(strip.repeat), 3),
+                        "scale": round(float(strip.scale), 3),
+                        "mute": strip.mute,
+                    }
+                    for strip in track.strips
+                ],
+            })
+        return tracks
+
+    def _get_timeline(self):
+        scene = bpy.context.scene
+        return {
+            "frame_start": scene.frame_start,
+            "frame_end": scene.frame_end,
+            "frame_current": scene.frame_current,
+            "fps": scene.render.fps,
+            "fps_base": round(float(scene.render.fps_base), 4),
+            "effective_fps": round(scene.render.fps / scene.render.fps_base, 3),
+        }
+
+    def _has_animation(self, obj):
+        for target, _ in self._get_anim_targets(obj):
+            anim = getattr(target, "animation_data", None)
+            if anim and (anim.action or len(anim.nla_tracks) or len(anim.drivers)):
+                return True
+        return False
+
+    def _is_dynamic(self, obj):
+        """True if the object's transform can change over time."""
+        while obj is not None:
+            if self._has_animation(obj) or len(obj.constraints):
+                return True
+            obj = obj.parent
+        return False
+
+    def insert_keyframes(self, object_name, data_path, keyframes, index=-1, interpolation=None):
+        """Insert keyframes on an object (or its data via a "data." prefix).
+
+        keyframes: list of {"frame": number, "value": optional scalar or list,
+                            "interpolation": optional}
+        """
+        obj = self._get_object(object_name)
+        target, path = self._resolve_anim_target(obj, data_path)
+        try:
+            target.path_resolve(path)
+        except ValueError:
+            raise ValueError(f"Invalid data_path '{data_path}' for object '{object_name}'")
+        if not keyframes:
+            raise ValueError("No keyframes given")
+        if interpolation and interpolation.upper() not in self._INTERPOLATIONS:
+            raise ValueError(f"Invalid interpolation: {interpolation}. Use one of {sorted(self._INTERPOLATIONS)}")
+
+        scene = bpy.context.scene
+        inserted = []
+        interp_by_frame = {}
+        for kf in keyframes:
+            if "frame" not in kf:
+                raise ValueError(f"Keyframe without 'frame': {kf}")
+            frame = float(kf["frame"])
+            if "value" in kf and kf["value"] is not None:
+                self._set_path_value(target, path, kf["value"], index)
+            if not target.keyframe_insert(data_path=path, index=index, frame=frame):
+                raise RuntimeError(f"Could not insert keyframe for '{data_path}' at frame {frame}")
+            inserted.append(frame)
+            kf_interp = kf.get("interpolation") or interpolation
+            if kf_interp:
+                kf_interp = kf_interp.upper()
+                if kf_interp not in self._INTERPOLATIONS:
+                    raise ValueError(f"Invalid interpolation: {kf_interp}")
+                interp_by_frame[frame] = kf_interp
+
+        fcurves = [fc for fc in self._get_fcurves(target)
+                   if fc.data_path == path and (index < 0 or fc.array_index == index)]
+        for fc in fcurves:
+            for kp in fc.keyframe_points:
+                interp = interp_by_frame.get(float(kp.co[0]))
+                if interp:
+                    kp.interpolation = interp
+            fc.update()
+
+        # Re-evaluate so the scene shows the animated state of the current frame
+        scene.frame_set(scene.frame_current)
+
+        prefix = "data." if target is not obj else ""
+        return {
+            "object": obj.name,
+            "data_path": data_path,
+            "inserted_frames": inserted,
+            "fcurves": [self._serialize_fcurve(fc, prefix) for fc in fcurves],
+        }
+
+    def delete_keyframes(self, object_name, data_path=None, frames=None, index=-1):
+        """Delete keyframes. Without data_path all channels, without frames all keys."""
+        obj = self._get_object(object_name)
+        if data_path:
+            target, path = self._resolve_anim_target(obj, data_path)
+            targets = [(target, path, "data." if target is not obj else "")]
+        else:
+            targets = [(t, None, prefix) for t, prefix in self._get_anim_targets(obj)]
+
+        frame_set = {round(float(f), 3) for f in frames} if frames is not None else None
+        removed = {}
+        for target, path, prefix in targets:
+            collection = self._get_fcurve_collection(target)
+            if collection is None:
+                continue
+            for fc in list(collection):
+                if path is not None and fc.data_path != path:
+                    continue
+                if index >= 0 and fc.array_index != index:
+                    continue
+                points = fc.keyframe_points
+                count = 0
+                for kp in reversed(list(points)):
+                    if frame_set is None or round(float(kp.co[0]), 3) in frame_set:
+                        points.remove(kp, fast=True)
+                        count += 1
+                if count:
+                    key = f"{prefix}{fc.data_path}[{fc.array_index}]"
+                    removed[key] = count
+                if len(points) == 0:
+                    collection.remove(fc)
+                else:
+                    fc.update()
+
+        scene = bpy.context.scene
+        scene.frame_set(scene.frame_current)
+        return {
+            "object": obj.name,
+            "removed": removed,
+            "removed_total": sum(removed.values()),
+        }
+
+    def get_animation_data(self, object_name=None, max_keyframes=100):
+        """Return fcurves, keyframe values and NLA tracks of one or all animated objects."""
+        if object_name:
+            objects = [self._get_object(object_name)]
+        else:
+            objects = [o for o in bpy.context.scene.objects if self._has_animation(o)]
+
+        result = {"timeline": self._get_timeline(), "objects": {}}
+        for obj in objects:
+            obj_data = {"fcurves": [], "actions": {}, "nla_tracks": {}, "drivers": []}
+            frames = []
+            for target, prefix in self._get_anim_targets(obj):
+                anim = getattr(target, "animation_data", None)
+                if not anim:
+                    continue
+                key = prefix.rstrip(".") or "object"
+                if anim.action:
+                    obj_data["actions"][key] = {
+                        "action": anim.action.name,
+                        "slot": anim.action_slot.name_display if getattr(anim, "action_slot", None) else None,
+                    }
+                for fc in self._get_fcurves(target):
+                    obj_data["fcurves"].append(self._serialize_fcurve(fc, prefix, max_keyframes))
+                    frames.extend(float(kp.co[0]) for kp in fc.keyframe_points)
+                nla = self._serialize_nla(anim)
+                if nla:
+                    obj_data["nla_tracks"][key] = nla
+                for drv in anim.drivers:
+                    obj_data["drivers"].append({
+                        "data_path": prefix + drv.data_path,
+                        "index": drv.array_index,
+                        "expression": drv.driver.expression if drv.driver.type == 'SCRIPTED' else drv.driver.type,
+                    })
+            if frames:
+                obj_data["frame_range"] = [min(frames), max(frames)]
+            result["objects"][obj.name] = obj_data
+        return result
+
+    def set_timeline(self, frame_start=None, frame_end=None, fps=None, frame_current=None):
+        """Set scene frame range, frame rate and/or current frame."""
+        scene = bpy.context.scene
+        start = frame_start if frame_start is not None else scene.frame_start
+        end = frame_end if frame_end is not None else scene.frame_end
+        if start > end:
+            raise ValueError(f"frame_start ({start}) must not be greater than frame_end ({end})")
+        # Set in an order that never makes start > end temporarily
+        if frame_end is not None and frame_end < scene.frame_start:
+            scene.frame_start = start
+            scene.frame_end = end
+        else:
+            scene.frame_end = end
+            scene.frame_start = start
+        if fps is not None:
+            if fps < 1:
+                raise ValueError("fps must be at least 1")
+            scene.render.fps = int(fps)
+            scene.render.fps_base = 1.0
+        if frame_current is not None:
+            scene.frame_set(int(frame_current))
+        return self._get_timeline()
+
+    def scrub_timeline(self, frame, object_names=None, restore_frame=False):
+        """Jump to a frame and return the evaluated state of animated objects."""
+        scene = bpy.context.scene
+        previous = (scene.frame_current, scene.frame_subframe)
+        frame = float(frame)
+        whole = int(frame // 1)
+        scene.frame_set(whole, subframe=frame - whole)
+
+        if object_names:
+            objects = [self._get_object(name) for name in object_names]
+        else:
+            objects = [o for o in scene.objects if self._is_dynamic(o)]
+
+        states = {}
+        for obj in objects:
+            loc, rot, scale = obj.matrix_world.decompose()
+            state = {
+                "world_location": self._round_vec(loc),
+                "world_rotation": self._round_vec(rot.to_euler()),
+                "world_scale": self._round_vec(scale),
+                "visible": obj.visible_get(),
+                "hide_render": obj.hide_render,
+            }
+            if obj.type == 'CAMERA':
+                state["focal_length"] = round(float(obj.data.lens), 4)
+            elif obj.type == 'LIGHT':
+                state["energy"] = round(float(obj.data.energy), 4)
+                state["color"] = self._round_vec(obj.data.color)
+            states[obj.name] = state
+
+        timeline = self._get_timeline()
+        timeline["frame_subframe"] = round(float(scene.frame_subframe), 4)
+        if restore_frame:
+            scene.frame_set(previous[0], subframe=previous[1])
+            timeline["restored_to_frame"] = previous[0]
+        return {"frame": frame, "timeline": timeline, "objects": states}
+
+    def set_visibility(self, object_names, hide_render=None, hide_viewport=None):
+        """Show or hide objects in renders and/or the viewport."""
+        if not object_names:
+            raise ValueError("No object names given")
+        objects = [self._get_object(name) for name in object_names]
+        for obj in objects:
+            if hide_render is not None:
+                obj.hide_render = bool(hide_render)
+            if hide_viewport is not None:
+                obj.hide_viewport = bool(hide_viewport)
+        return {"objects": {o.name: {"hide_render": o.hide_render, "hide_viewport": o.hide_viewport}
+                            for o in objects}}
+
+    # ---- NLA ----
+
+    _BLEND_TYPES = {'REPLACE', 'COMBINE', 'ADD', 'SUBTRACT', 'MULTIPLY'}
+    _STRIP_EXTRAPOLATIONS = {'HOLD', 'HOLD_FORWARD', 'NOTHING'}
+
+    def _get_nla_owner(self, obj, target):
+        if target == "object":
+            return obj
+        if target == "data":
+            if obj.data is None:
+                raise ValueError(f"Object '{obj.name}' has no data block")
+            return obj.data
+        raise ValueError(f"Invalid target: {target}. Use 'object' or 'data'")
+
+    def _get_nla_track(self, anim, track_name):
+        track = anim.nla_tracks.get(track_name) if anim else None
+        if not track:
+            raise ValueError(f"NLA track not found: {track_name}")
+        return track
+
+    def _get_nla_strip(self, track, strip_name):
+        strip = track.strips.get(strip_name)
+        if not strip:
+            raise ValueError(f"NLA strip not found in track '{track.name}': {strip_name}")
+        return strip
+
+    def _apply_strip_settings(self, strip, repeat=None, scale=None, blend_type=None,
+                              extrapolation=None, blend_in=None, blend_out=None, mute=None):
+        if blend_type is not None:
+            if blend_type.upper() not in self._BLEND_TYPES:
+                raise ValueError(f"Invalid blend_type: {blend_type}. Use one of {sorted(self._BLEND_TYPES)}")
+            strip.blend_type = blend_type.upper()
+        if extrapolation is not None:
+            if extrapolation.upper() not in self._STRIP_EXTRAPOLATIONS:
+                raise ValueError(f"Invalid extrapolation: {extrapolation}. Use one of {sorted(self._STRIP_EXTRAPOLATIONS)}")
+            strip.extrapolation = extrapolation.upper()
+        if repeat is not None:
+            strip.repeat = float(repeat)
+        if scale is not None:
+            strip.scale = float(scale)
+        if blend_in is not None:
+            strip.blend_in = float(blend_in)
+        if blend_out is not None:
+            strip.blend_out = float(blend_out)
+        if mute is not None:
+            strip.mute = bool(mute)
+
+    def _nla_result(self, obj, owner):
+        bpy.context.scene.frame_set(bpy.context.scene.frame_current)
+        anim = owner.animation_data
+        return {
+            "object": obj.name,
+            "target": "object" if owner is obj else "data",
+            "active_action": anim.action.name if anim and anim.action else None,
+            "nla_tracks": self._serialize_nla(anim),
+        }
+
+    def push_action_to_nla(self, object_name, target="object", track_name=None, strip_name=None):
+        """Move the active action into a new NLA track (like 'Push Down' in the UI)."""
+        obj = self._get_object(object_name)
+        owner = self._get_nla_owner(obj, target)
+        anim = owner.animation_data
+        if not anim or not anim.action:
+            raise ValueError(f"'{object_name}' ({target}) has no active action to push down")
+        action = anim.action
+        slot = getattr(anim, "action_slot", None)
+        track = anim.nla_tracks.new()
+        if track_name:
+            track.name = track_name
+        strip = track.strips.new(strip_name or action.name, int(action.frame_range[0]), action)
+        if slot is not None and hasattr(strip, "action_slot"):
+            strip.action_slot = slot
+        anim.action = None
+        return self._nla_result(obj, owner)
+
+    def add_nla_strip(self, object_name, action_name, frame_start, target="object",
+                      track_name=None, strip_name=None, repeat=None, scale=None,
+                      blend_type=None, extrapolation=None, blend_in=None, blend_out=None):
+        """Add an action as NLA strip, on an existing or new track."""
+        obj = self._get_object(object_name)
+        owner = self._get_nla_owner(obj, target)
+        action = bpy.data.actions.get(action_name)
+        if not action:
+            raise ValueError(f"Action not found: {action_name}")
+        anim = owner.animation_data or owner.animation_data_create()
+        track = anim.nla_tracks.get(track_name) if track_name else None
+        if track is None:
+            track = anim.nla_tracks.new()
+            if track_name:
+                track.name = track_name
+        try:
+            strip = track.strips.new(strip_name or action.name, int(frame_start), action)
+        except RuntimeError as e:
+            raise ValueError(f"Could not add strip at frame {frame_start} on track '{track.name}': {e}")
+        self._apply_strip_settings(strip, repeat, scale, blend_type, extrapolation, blend_in, blend_out)
+        return self._nla_result(obj, owner)
+
+    def update_nla_strip(self, object_name, track_name, strip_name, target="object",
+                         frame_start=None, repeat=None, scale=None, blend_type=None,
+                         extrapolation=None, blend_in=None, blend_out=None, mute=None):
+        """Move or change an NLA strip."""
+        obj = self._get_object(object_name)
+        owner = self._get_nla_owner(obj, target)
+        track = self._get_nla_track(owner.animation_data, track_name)
+        strip = self._get_nla_strip(track, strip_name)
+        self._apply_strip_settings(strip, repeat, scale, blend_type, extrapolation, blend_in, blend_out, mute)
+        if frame_start is not None:
+            # frame_start_ui moves the strip and keeps its length
+            strip.frame_start_ui = float(frame_start)
+        return self._nla_result(obj, owner)
+
+    def remove_nla(self, object_name, track_name, strip_name=None, target="object"):
+        """Remove an NLA strip, or the whole track if no strip is given."""
+        obj = self._get_object(object_name)
+        owner = self._get_nla_owner(obj, target)
+        anim = owner.animation_data
+        track = self._get_nla_track(anim, track_name)
+        if strip_name:
+            track.strips.remove(self._get_nla_strip(track, strip_name))
+        else:
+            anim.nla_tracks.remove(track)
+        return self._nla_result(obj, owner)
+
+    def set_nla_track(self, object_name, track_name, target="object", mute=None, solo=None, name=None):
+        """Mute, solo or rename an NLA track."""
+        obj = self._get_object(object_name)
+        owner = self._get_nla_owner(obj, target)
+        track = self._get_nla_track(owner.animation_data, track_name)
+        if mute is not None:
+            track.mute = bool(mute)
+        if solo is not None:
+            track.is_solo = bool(solo)
+        if name:
+            track.name = name
+        return self._nla_result(obj, owner)
+
+    # ---- Scientific visualization ----
+
+    # viridis at 0, 0.25, 0.5, 0.75, 1, converted from sRGB to linear RGB
+    _VIRIDIS = [
+        (0.0, (0.0580, 0.0004, 0.0887)),
+        (0.25, (0.0431, 0.0848, 0.2588)),
+        (0.5, (0.0148, 0.2813, 0.2639)),
+        (0.75, (0.1123, 0.5852, 0.1212)),
+        (1.0, (0.9847, 0.7997, 0.0182)),
+    ]
+
+    _EXPR_FUNCS = (
+        "sin", "cos", "tan", "arcsin", "arccos", "arctan", "arctan2", "sinh", "cosh",
+        "tanh", "exp", "log", "log10", "sqrt", "abs", "sign", "minimum", "maximum",
+        "where", "hypot", "floor", "ceil",
+    )
+
+    def _expr_namespace(self, variables, params):
+        import numpy as np
+        ns = {name: getattr(np, name) for name in self._EXPR_FUNCS}
+        ns.update({"pi": np.pi, "e": np.e})
+        for key, value in (params or {}).items():
+            if not str(key).isidentifier() or key in ns or key in variables:
+                raise ValueError(f"Invalid or reserved parameter name: {key}")
+            ns[key] = float(value)
+        ns.update(variables)
+        return ns
+
+    def _compile_vector_expr(self, exprs, var_names, params):
+        """Compile 3 expression strings into f(**vars) -> (N, 3) array."""
+        import numpy as np
+        if not isinstance(exprs, (list, tuple)) or len(exprs) != 3:
+            raise ValueError("Expected a list of 3 expressions for the x, y and z components")
+        self._expr_namespace(dict.fromkeys(var_names), params)  # validates parameter names
+        codes = []
+        for expr in exprs:
+            try:
+                codes.append(compile(str(expr), "<expr>", "eval"))
+            except SyntaxError as e:
+                raise ValueError(f"Invalid expression '{expr}': {e.msg}")
+            names = set(codes[-1].co_names)
+            allowed = set(self._EXPR_FUNCS) | {"pi", "e"} | set(var_names) | set(params or {})
+            unknown = names - allowed
+            if unknown:
+                raise ValueError(f"Unknown names in '{expr}': {sorted(unknown)}. "
+                                 f"Variables: {list(var_names)}, functions: {list(self._EXPR_FUNCS)}")
+
+        def evaluate(**variables):
+            n = len(next(iter(variables.values())))
+            ns = self._expr_namespace(variables, params)
+            out = np.empty((n, 3))
+            with np.errstate(all="ignore"):
+                for i, code in enumerate(codes):
+                    out[:, i] = np.broadcast_to(eval(code, {"__builtins__": {}}, ns), (n,))
+            return out
+        return evaluate
+
+    def _colormap(self, t):
+        t = min(max(float(t), 0.0), 1.0)
+        for (t0, c0), (t1, c1) in zip(self._VIRIDIS, self._VIRIDIS[1:]):
+            if t <= t1:
+                f = (t - t0) / (t1 - t0)
+                return tuple(a + (b - a) * f for a, b in zip(c0, c1))
+        return self._VIRIDIS[-1][1]
+
+    def _replace_object(self, name):
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return
+        data = obj.data
+        materials = [m for m in getattr(data, "materials", []) if m is not None]
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if data is not None and data.users == 0:
+            if isinstance(data, bpy.types.Mesh):
+                bpy.data.meshes.remove(data)
+            elif isinstance(data, bpy.types.Curve):
+                bpy.data.curves.remove(data)
+        for mat in materials:
+            if mat.users == 0:
+                bpy.data.materials.remove(mat)
+
+    def _solid_material(self, name, color, emission=0.0):
+        mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+        if bpy.app.version < (5, 0, 0):
+            mat.use_nodes = True
+        bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if bsdf is None:
+            bsdf = mat.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
+        rgba = (*color[:3], 1.0)
+        bsdf.inputs["Base Color"].default_value = rgba
+        bsdf.inputs["Roughness"].default_value = 0.4
+        emission_color = bsdf.inputs.get("Emission Color") or bsdf.inputs.get("Emission")
+        if emission_color is not None:
+            emission_color.default_value = rgba
+        if "Emission Strength" in bsdf.inputs:
+            bsdf.inputs["Emission Strength"].default_value = emission
+        mat.diffuse_color = rgba
+        return mat
+
+    def _attribute_colormap_material(self, name, attribute):
+        """Material coloring by a 0..1 float attribute through a viridis color ramp."""
+        mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+        if bpy.app.version < (5, 0, 0):
+            mat.use_nodes = True
+        nodes, links = mat.node_tree.nodes, mat.node_tree.links
+        nodes.clear()
+        out = nodes.new("ShaderNodeOutputMaterial")
+        bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+        attr = nodes.new("ShaderNodeAttribute")
+        attr.attribute_name = attribute
+        ramp = nodes.new("ShaderNodeValToRGB")
+        elements = ramp.color_ramp.elements
+        elements[0].position, elements[0].color = 0.0, (*self._VIRIDIS[0][1], 1.0)
+        elements[1].position, elements[1].color = 1.0, (*self._VIRIDIS[-1][1], 1.0)
+        for pos, color in self._VIRIDIS[1:-1]:
+            elements.new(pos).color = (*color, 1.0)
+        links.new(attr.outputs["Fac"], ramp.inputs["Fac"])
+        links.new(ramp.outputs["Color"], bsdf.inputs["Base Color"])
+        links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+        bsdf.inputs["Roughness"].default_value = 0.4
+        return mat
+
+    def _arrow_template(self, sides=8, shaft_radius=0.04, head_radius=0.1, head_length=0.3):
+        """Unit arrow along +Z from 0 to 1. Returns (verts, faces) as numpy arrays."""
+        import numpy as np
+        angles = np.linspace(0, 2 * np.pi, sides, endpoint=False)
+        ring = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+        z_neck = 1.0 - head_length
+        verts = np.concatenate([
+            np.column_stack([ring * shaft_radius, np.zeros(sides)]),        # shaft bottom
+            np.column_stack([ring * shaft_radius, np.full(sides, z_neck)]),  # shaft top
+            np.column_stack([ring * head_radius, np.full(sides, z_neck)]),   # head base
+            [[0.0, 0.0, 1.0], [0.0, 0.0, 0.0]],                            # tip, bottom center
+        ])
+        tip, bottom = 3 * sides, 3 * sides + 1
+        faces = []
+        for i in range(sides):
+            j = (i + 1) % sides
+            faces.append([i, j, sides + j, sides + i])                       # shaft side
+            faces.append([sides + i, sides + j, 2 * sides + j, 2 * sides + i])  # neck ring
+            faces.append([2 * sides + i, 2 * sides + j, tip])                # head cone
+            faces.append([j, i, bottom])                                     # bottom cap
+        return verts, faces
+
+    def _rotations_to(self, directions):
+        """Rotation matrices (N, 3, 3) turning +Z onto each unit direction."""
+        import numpy as np
+        d = directions
+        n = len(d)
+        c = d[:, 2]
+        v = np.stack([-d[:, 1], d[:, 0], np.zeros(n)], axis=1)  # z x d
+        k = np.zeros((n, 3, 3))
+        k[:, 0, 1], k[:, 0, 2] = -v[:, 2], v[:, 1]
+        k[:, 1, 0], k[:, 1, 2] = v[:, 2], -v[:, 0]
+        k[:, 2, 0], k[:, 2, 1] = -v[:, 1], v[:, 0]
+        with np.errstate(all="ignore"):
+            factor = np.where(c > -1 + 1e-9, 1.0 / (1.0 + c), 0.0)
+        rot = np.eye(3)[None] + k + np.einsum("nij,njk->nik", k, k) * factor[:, None, None]
+        rot[c <= -1 + 1e-9] = np.diag([1.0, -1.0, -1.0])
+        return rot
+
+    def _build_arrows(self, name, points, vectors, magnitudes, arrow_length, normalize, thickness,
+                      color_scale="linear"):
+        import numpy as np
+        m_max = float(magnitudes.max())
+        dirs = vectors / magnitudes[:, None]
+        lengths = np.full(len(points), arrow_length) if normalize else arrow_length * magnitudes / m_max
+        widths = np.minimum(1.0, lengths / arrow_length) * thickness / 0.04
+
+        tmpl_v, tmpl_f = self._arrow_template()
+        rot = self._rotations_to(dirs)
+        scaled = tmpl_v[None] * np.stack([widths, widths, lengths], axis=1)[:, None, :]
+        # Arrows are centered on their sample point
+        scaled[:, :, 2] -= lengths[:, None] / 2
+        verts = np.einsum("nij,nvj->nvi", rot, scaled) + points[:, None, :]
+        nv = len(tmpl_v)
+        faces = [[i * nv + idx for idx in face] for i in range(len(points)) for face in tmpl_f]
+
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata(verts.reshape(-1, 3).tolist(), [], faces)
+        mesh.update()
+        values = np.log10(magnitudes) if color_scale == "log" else magnitudes
+        span = float(values.max() - values.min()) or 1.0
+        norm = np.repeat((values - values.min()) / span, nv).astype(np.float32)
+        attr = mesh.attributes.new("magnitude", 'FLOAT', 'POINT')
+        attr.data.foreach_set("value", norm)
+        mesh.materials.append(self._attribute_colormap_material(f"{name}_colormap", "magnitude"))
+        obj = bpy.data.objects.new(name, mesh)
+        bpy.context.scene.collection.objects.link(obj)
+        return obj
+
+    def _build_polyline_curve(self, name, polylines, thickness, materials=None, material_indices=None,
+                              radii=None):
+        import numpy as np
+        curve = bpy.data.curves.new(name, 'CURVE')
+        curve.dimensions = '3D'
+        curve.bevel_depth = thickness
+        curve.bevel_resolution = 2
+        curve.use_fill_caps = True
+        # Materials must exist before material_index is set, otherwise it is clamped to 0
+        for mat in materials or []:
+            curve.materials.append(mat)
+        for i, line in enumerate(polylines):
+            spline = curve.splines.new('POLY')
+            spline.points.add(len(line) - 1)
+            co = np.column_stack([line, np.ones(len(line))]).astype(np.float32)
+            spline.points.foreach_set("co", co.ravel())
+            if radii is not None:
+                spline.points.foreach_set("radius", np.full(len(line), radii[i], dtype=np.float32))
+            if material_indices is not None:
+                spline.material_index = material_indices[i]
+        obj = bpy.data.objects.new(name, curve)
+        bpy.context.scene.collection.objects.link(obj)
+        return obj
+
+    def _integrate_streamlines(self, field, seeds, bounds, step_size, max_steps):
+        """RK4 along the normalized field (arc length), both directions from each seed."""
+        import numpy as np
+        lo, hi = bounds[:, 0], bounds[:, 1]
+        margin = 1e-6 + 0.01 * (hi - lo)
+
+        def direction(p):
+            f = field(x=p[:, 0], y=p[:, 1], z=p[:, 2])
+            norm = np.linalg.norm(f, axis=1)
+            with np.errstate(all="ignore"):
+                d = f / norm[:, None]
+            bad = ~np.isfinite(d).all(axis=1) | (norm < 1e-12)
+            d[bad] = 0.0
+            return d, bad
+
+        halves = []
+        for sign in (1.0, -1.0):
+            p = seeds.copy()
+            alive = np.ones(len(p), dtype=bool)
+            paths = [[q.copy()] for q in p]
+            h = sign * step_size
+            for _ in range(max_steps):
+                if not alive.any():
+                    break
+                idx = np.nonzero(alive)[0]
+                q = p[idx]
+                k1, b1 = direction(q)
+                k2, b2 = direction(q + h / 2 * k1)
+                k3, b3 = direction(q + h / 2 * k2)
+                k4, b4 = direction(q + h * k3)
+                nxt = q + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+                inside = ((nxt >= lo - margin) & (nxt <= hi + margin)).all(axis=1)
+                ok = inside & ~(b1 | b2 | b3 | b4) & np.isfinite(nxt).all(axis=1)
+                for j, i in enumerate(idx):
+                    if ok[j]:
+                        paths[i].append(nxt[j])
+                p[idx[ok]] = nxt[ok]
+                alive[idx[~ok]] = False
+            halves.append(paths)
+
+        lines, line_seeds = [], []
+        for seed, fwd, bwd in zip(seeds, *halves):
+            line = np.array(bwd[::-1] + fwd[1:])
+            if len(line) >= 2:
+                lines.append(line)
+                line_seeds.append(seed)
+        return lines, line_seeds
+
+    def plot_vector_field(self, name, field, bounds, resolution=(10, 10, 1), params=None,
+                          mode="arrows", normalize=True, arrow_scale=0.8, thickness=0.02,
+                          color_scale="auto", seed_center=None, seed_radius=None, seed_count=16,
+                          seeds=None, seed_resolution=None, step_size=None, max_steps=500,
+                          streamline_color=(0.7, 0.7, 0.72)):
+        """Visualize a vector field F(x, y, z) as colored arrows and/or streamlines."""
+        import numpy as np
+        if mode not in ("arrows", "streamlines", "both"):
+            raise ValueError("mode must be 'arrows', 'streamlines' or 'both'")
+        bounds = np.array(bounds, dtype=float)
+        if bounds.shape != (3, 2) or (bounds[:, 1] < bounds[:, 0]).any():
+            raise ValueError("bounds must be [[xmin, xmax], [ymin, ymax], [zmin, zmax]] with min <= max")
+        res = [max(1, int(r)) for r in resolution]
+        if len(res) != 3 or np.prod(res) > 20000:
+            raise ValueError("resolution must have 3 entries with at most 20000 samples in total")
+        f = self._compile_vector_expr(field, ("x", "y", "z"), params)
+
+        axes = [np.linspace(lo, hi, n) if n > 1 else np.array([(lo + hi) / 2])
+                for (lo, hi), n in zip(bounds, res)]
+        grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+        spacing = min((hi - lo) / (n - 1) for (lo, hi), n in zip(bounds, res) if n > 1) \
+            if any(n > 1 for n in res) else 1.0
+
+        result = {"name": name, "objects": []}
+        if mode in ("arrows", "both"):
+            vectors = f(x=grid[:, 0], y=grid[:, 1], z=grid[:, 2])
+            mags = np.linalg.norm(vectors, axis=1)
+            valid = np.isfinite(vectors).all(axis=1) & (mags > 1e-12)
+            if not valid.any():
+                raise ValueError("The field is zero or undefined at all sample points")
+            if color_scale not in ("auto", "linear", "log"):
+                raise ValueError("color_scale must be 'auto', 'linear' or 'log'")
+            m = mags[valid]
+            if color_scale == "auto":
+                color_scale = "log" if m.max() / m.min() > 100 else "linear"
+            self._replace_object(name)
+            obj = self._build_arrows(name, grid[valid], vectors[valid], m,
+                                     arrow_scale * spacing, normalize, thickness, color_scale)
+            result["objects"].append(obj.name)
+            result["arrows"] = int(valid.sum())
+            result["skipped_samples"] = int((~valid).sum())
+            result["magnitude_range"] = [round(float(mags[valid].min()), 6), round(float(mags[valid].max()), 6)]
+            result["color"] = f"viridis by {color_scale} magnitude (dark = weak, yellow = strong)"
+
+        if mode in ("streamlines", "both"):
+            if seeds is not None:
+                seed_pts = np.array(seeds, dtype=float).reshape(-1, 3)
+            elif seed_radius is not None:
+                seed_pts = self._seeds_around(np.array(seed_center if seed_center is not None else
+                                                       bounds.mean(axis=1), dtype=float),
+                                              float(seed_radius), int(seed_count), bounds)
+            else:
+                # About a quarter of the arrow resolution keeps the arrows visible between lines
+                seed_res = seed_resolution or [max(2, n // 4) if n > 1 else 1 for n in res]
+                seed_axes = [np.linspace(lo, hi, n + 2)[1:-1] if n > 1 else np.array([(lo + hi) / 2])
+                             for (lo, hi), n in zip(bounds, seed_res)]
+                seed_pts = np.stack(np.meshgrid(*seed_axes, indexing="ij"), axis=-1).reshape(-1, 3)
+            if len(seed_pts) > 2000:
+                raise ValueError("At most 2000 streamline seeds are supported")
+            h = step_size or spacing * 0.1
+            # Keep flat fields flat: integrate within the degenerate axis range
+            lines, line_seeds = self._integrate_streamlines(f, seed_pts, bounds, h, int(max_steps))
+            if not lines:
+                raise ValueError("No streamline could be traced from the seeds")
+            traced = len(lines)
+            lines = self._drop_duplicate_lines(lines, line_seeds, tolerance=3 * h)
+            stream_name = f"{name}_streamlines"
+            self._replace_object(stream_name)
+            mat = self._solid_material(f"{stream_name}_mat", streamline_color)
+            obj = self._build_polyline_curve(stream_name, lines, thickness * 0.5, [mat])
+            result["objects"].append(obj.name)
+            result["streamlines"] = len(lines)
+            if traced > len(lines):
+                result["duplicate_streamlines_removed"] = traced - len(lines)
+            result["streamline_points"] = int(sum(len(l) for l in lines))
+        return result
+
+    def _seeds_around(self, center, radius, count, bounds):
+        """Seeds on a circle (planar bounds: in the plane of the non-flat axes) or a sphere."""
+        import numpy as np
+        if radius <= 0 or count < 1:
+            raise ValueError("seed_radius must be > 0 and seed_count >= 1")
+        flat = [i for i in range(3) if bounds[i, 0] == bounds[i, 1]]
+        if len(flat) == 1:
+            a, b = [i for i in range(3) if i != flat[0]]
+            angles = np.linspace(0, 2 * np.pi, count, endpoint=False) + np.pi / count
+            pts = np.tile(center, (count, 1))
+            pts[:, a] += radius * np.cos(angles)
+            pts[:, b] += radius * np.sin(angles)
+            return pts
+        # Fibonacci sphere: evenly spread points
+        i = np.arange(count) + 0.5
+        polar = np.arccos(1 - 2 * i / count)
+        azimuth = np.pi * (1 + 5 ** 0.5) * i
+        return center + radius * np.column_stack([np.cos(azimuth) * np.sin(polar),
+                                                  np.sin(azimuth) * np.sin(polar), np.cos(polar)])
+
+    def _drop_duplicate_lines(self, lines, seeds, tolerance):
+        """Remove streamlines traced twice: two lines are the same field line when each
+        passes through the other's seed (e.g. a closed line crossing a seed circle twice)."""
+        import numpy as np
+
+        def passes(line, point):
+            return np.linalg.norm(line - point, axis=1).min() < tolerance
+
+        kept = []
+        for i, line in enumerate(lines):
+            if not any(passes(lines[j], seeds[i]) and passes(line, seeds[j]) for j in kept):
+                kept.append(i)
+        return [lines[i] for i in kept]
+
+    def _integrate_ode(self, rhs, initial, t0, t1, steps):
+        """Fixed-step RK4 for all initial conditions at once. Returns (steps+1, K, 3) and times."""
+        import numpy as np
+        dt = (t1 - t0) / steps
+        y = np.array(initial, dtype=float).reshape(-1, 3)
+        out = np.full((steps + 1, len(y), 3), np.nan)
+        out[0] = y
+
+        def f(t, y):
+            return rhs(x=y[:, 0], y=y[:, 1], z=y[:, 2], t=np.full(len(y), t))
+
+        t = t0
+        for i in range(steps):
+            k1 = f(t, y)
+            k2 = f(t + dt / 2, y + dt / 2 * k1)
+            k3 = f(t + dt / 2, y + dt / 2 * k2)
+            k4 = f(t + dt, y + dt * k3)
+            y = y + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+            t += dt
+            out[i + 1] = y
+        return out, np.linspace(t0, t1, steps + 1)
+
+    def plot_trajectory(self, name, points=None, ode=None, initial=None, t_span=(0.0, 10.0),
+                        steps=2000, params=None, thickness=0.03, color=None, fit_size=None,
+                        animate=False, frame_start=None, frame_end=None, marker_size=None):
+        """Draw trajectories from given points or by integrating an ODE dx/dt = F(x, y, z, t)."""
+        import numpy as np
+        if (points is None) == (ode is None):
+            raise ValueError("Give either 'points' or 'ode' (with 'initial')")
+        if points is not None:
+            arr = np.array(points, dtype=float)
+            lines = [arr] if arr.ndim == 2 else list(arr)
+            source = "points"
+        else:
+            if initial is None:
+                raise ValueError("'initial' is required with 'ode'")
+            steps = int(steps)
+            if not 1 <= steps <= 200000:
+                raise ValueError("steps must be between 1 and 200000")
+            rhs = self._compile_vector_expr(ode, ("x", "y", "z", "t"), params)
+            sol, _ = self._integrate_ode(rhs, initial, float(t_span[0]), float(t_span[1]), steps)
+            lines = [sol[:, k] for k in range(sol.shape[1])]
+            source = "ode"
+
+        cleaned, truncated = [], 0
+        for line in lines:
+            line = np.asarray(line, dtype=float).reshape(-1, 3)
+            finite = np.isfinite(line).all(axis=1)
+            if not finite.all():
+                truncated += 1
+                line = line[:np.argmin(finite)]  # cut at the first non-finite point
+            if len(line) >= 2:
+                cleaned.append(line)
+        if not cleaned:
+            raise ValueError("No trajectory with at least 2 finite points")
+
+        all_pts = np.concatenate(cleaned)
+        transform = {"scale": 1.0, "offset": [0.0, 0.0, 0.0]}
+        if fit_size:
+            center = (all_pts.max(axis=0) + all_pts.min(axis=0)) / 2
+            extent = float((all_pts.max(axis=0) - all_pts.min(axis=0)).max()) or 1.0
+            scale = float(fit_size) / extent
+            cleaned = [(line - center) * scale for line in cleaned]
+            transform = {"scale": round(scale, 6), "offset": self._round_vec(-center * scale)}
+
+        n = len(cleaned)
+        colors = [color] * n if color else [self._colormap(i / max(n - 1, 1)) for i in range(n)]
+        mats = [self._solid_material(f"{name}_mat_{i}", c, emission=0.3) for i, c in enumerate(colors)]
+        self._replace_object(name)
+        # Slightly thinner tubes for later trajectories: where trajectories coincide, the
+        # outer tube shows one clean color instead of z-fighting stripes
+        radii = [1.0 - 0.15 * i / max(n - 1, 1) for i in range(n)]
+        obj = self._build_polyline_curve(name, cleaned, thickness, mats, list(range(n)), radii)
+
+        result = {"name": name, "source": source, "trajectories": n,
+                  "points_per_trajectory": [len(l) for l in cleaned],
+                  "bounds": [self._round_vec(all_pts.min(axis=0)), self._round_vec(all_pts.max(axis=0))],
+                  "transform": transform}
+        if truncated:
+            result["truncated_nonfinite"] = truncated
+
+        if animate:
+            scene = bpy.context.scene
+            fs = scene.frame_start if frame_start is None else int(frame_start)
+            fe = scene.frame_end if frame_end is None else int(frame_end)
+            if fe <= fs:
+                raise ValueError("frame_end must be greater than frame_start")
+            curve = obj.data
+            # SPLINE mapping follows point index, i.e. integration time for ODE trajectories
+            curve.bevel_factor_mapping_end = 'SPLINE'
+            curve.bevel_factor_end = 0.0
+            curve.keyframe_insert("bevel_factor_end", frame=fs)
+            curve.bevel_factor_end = 1.0
+            curve.keyframe_insert("bevel_factor_end", frame=fe)
+            for fc in self._get_fcurves(curve):
+                for kp in fc.keyframe_points:
+                    kp.interpolation = 'LINEAR'
+
+            markers = []
+            radius = marker_size or thickness * 3
+            frames = np.arange(fs, fe + 1)
+            for i, line in enumerate(cleaned):
+                marker_name = f"{name}_marker_{i}"
+                self._replace_object(marker_name)
+                mesh = bpy.data.meshes.new(marker_name)
+                import bmesh
+                bm = bmesh.new()
+                bmesh.ops.create_uvsphere(bm, u_segments=16, v_segments=8, radius=radius)
+                bm.to_mesh(mesh)
+                bm.free()
+                mesh.materials.append(self._solid_material(f"{name}_marker_mat_{i}", colors[i], emission=2.0))
+                marker = bpy.data.objects.new(marker_name, mesh)
+                scene.collection.objects.link(marker)
+                marker.parent = obj
+                idx = np.round((frames - fs) / (fe - fs) * (len(line) - 1)).astype(int)
+                for frame, j in zip(frames, idx):
+                    marker.location = line[j]
+                    marker.keyframe_insert("location", frame=int(frame))
+                for fc in self._get_fcurves(marker):
+                    for kp in fc.keyframe_points:
+                        kp.interpolation = 'LINEAR'
+                markers.append(marker_name)
+            scene.frame_set(scene.frame_current)
+            result["animation"] = {"frame_start": fs, "frame_end": fe, "markers": markers}
+        return result
 
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""

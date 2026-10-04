@@ -974,7 +974,7 @@ def plot_vector_data(ctx: Context, name: str, points: List[List[float]] = None,
     - clamp_percentile: Magnitudes above this percentile share the maximum length and color,
       so outliers near sources don't shrink everything else. 100 disables clamping.
     - color_scale: "linear", "log" or "auto" (log if magnitudes span more than 100x)
-    - thickness: Arrow shaft radius (default: 2.5% of arrow_length)
+    - thickness: Arrow shaft radius (default: 6% of arrow_length)
     - status: "checked" (default) or "estimate"; estimates are drawn greyed and translucent
 
     Zero and non-finite vectors are skipped.

@@ -2410,7 +2410,7 @@ class BlenderMCPServer:
         length = float(arrow_length) if arrow_length else self._arrow_length_for(pts)
         self._replace_object(name)
         obj = self._build_arrows(name, pts, vec / mags[:, None] * shown[:, None], shown, length,
-                                 normalize, thickness or 0.025 * length, color_scale)
+                                 normalize, thickness or 0.06 * length, color_scale)
         if status == "estimate":
             self._set_material_alpha(obj.active_material, 0.35)
         if collection is not None:
@@ -2661,7 +2661,7 @@ class BlenderMCPServer:
         import numpy as np
         d = np.asarray(d_local, dtype=float)
         d = d / (np.linalg.norm(d) or 1.0)
-        length = 2.4 * float(max(half))
+        length = 1.8 * float(max(half))
         width = 4.0 * float(min(half))  # head radius = 0.4 x smallest half extent
         tmpl_v, tmpl_f = self._arrow_template()
         verts = tmpl_v * np.array([width, width, length])
